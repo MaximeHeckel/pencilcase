@@ -80,7 +80,8 @@ final class RulerController: ObservableObject {
         window.title = "Pencil Case Ruler"
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.hasShadow = true
+        // Native glass already defines its edge; avoid an additional dark window shadow.
+        window.hasShadow = false
         window.level = .floating
         window.hidesOnDeactivate = false
         window.acceptsMouseMovedEvents = true

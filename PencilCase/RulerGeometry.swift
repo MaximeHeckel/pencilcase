@@ -2,6 +2,7 @@ import Foundation
 
 struct RulerGeometry {
     static let height: CGFloat = 76
+    static let cornerRadius: CGFloat = 13
     // Leave room for four-digit endpoint labels before the resize grips.
     static let inset: CGFloat = 40
     static let minimumLength: CGFloat = 100

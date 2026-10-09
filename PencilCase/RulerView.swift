@@ -22,7 +22,7 @@ final class RulerView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         glass.style = .clear
-        glass.cornerRadius = 9
+        glass.cornerRadius = RulerGeometry.cornerRadius
         glass.contentView = markings
         markings.owner = self
         addSubview(glass)
@@ -215,7 +215,125 @@ private final class RulerMarkingsView: NSView {
         addCursorRect(NSRect(x: bounds.width - 18, y: 0, width: 18, height: bounds.height), cursor: resizeCursor)
     }
 
+    private func drawEdgeHighlight() {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+
+        // A single fine reflection, inset to stay inside the native glass.
+        // Keep its light direction fixed on screen as the instrument rotates.
+        let edge = bounds.insetBy(dx: 0.65, dy: 0.65)
+        let radius = RulerGeometry.cornerRadius - 0.65
+        let lightAngle = (125 - geometry.angle) * .pi / 180
+        let direction = CGPoint(x: cos(lightAngle), y: sin(lightAngle))
+        let reach = abs(direction.x) * edge.width / 2 + abs(direction.y) * edge.height / 2
+        let center = CGPoint(x: edge.midX, y: edge.midY)
+
+        context.saveGState()
+        defer { context.restoreGState() }
+
+        context.addPath(CGPath(roundedRect: edge, cornerWidth: radius,
+                               cornerHeight: radius, transform: nil))
+        context.setLineWidth(0.75)
+        context.replacePathWithStrokedPath()
+        context.clip()
+
+        let colors = [NSColor.white.withAlphaComponent(0.035).cgColor,
+                      NSColor.white.withAlphaComponent(0.10).cgColor,
+                      NSColor.white.withAlphaComponent(0.38).cgColor] as CFArray
+        guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                                        colors: colors, locations: [0, 0.55, 1]) else { return }
+
+        context.drawLinearGradient(gradient,
+            start: CGPoint(x: center.x - direction.x * reach, y: center.y - direction.y * reach),
+            end: CGPoint(x: center.x + direction.x * reach, y: center.y + direction.y * reach),
+            options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+    }
+
+    private func drawSurfaceOptics() {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+
+        let angle = (125 - geometry.angle) * .pi / 180
+        let direction = CGPoint(x: cos(angle), y: sin(angle))
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let reach = abs(direction.x) * bounds.width / 2 + abs(direction.y) * bounds.height / 2
+        let start = CGPoint(x: center.x - direction.x * reach, y: center.y - direction.y * reach)
+        let end = CGPoint(x: center.x + direction.x * reach, y: center.y + direction.y * reach)
+
+        func gradient(_ colors: [NSColor], locations: [CGFloat]) {
+            guard let fill = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: colors.map { $0.cgColor } as CFArray, locations: locations) else { return }
+
+            context.drawLinearGradient(fill, start: start, end: end,
+                options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+        }
+
+        // A broad reflection across the face; no blur, capture, or animation loop.
+        context.saveGState()
+        context.addPath(CGPath(roundedRect: bounds.insetBy(dx: 0.8, dy: 0.8),
+                              cornerWidth: RulerGeometry.cornerRadius - 0.8, cornerHeight: RulerGeometry.cornerRadius - 0.8, transform: nil))
+        context.clip()
+        gradient([.white.withAlphaComponent(0), .white.withAlphaComponent(0),
+                  .white.withAlphaComponent(0.055), .white.withAlphaComponent(0)],
+                 locations: [0, 0.28, 0.62, 1])
+        context.restoreGState()
+
+        // Adjacent filled bands approximate a continuous falloff without the
+        // gaps of concentric strokes. The lit side has a wider, softer shoulder.
+        let step: CGFloat = 0.25
+        for index in 0..<16 {
+            let inset = 0.9 + CGFloat(index) * step
+            let depth = CGFloat(index) * step
+            let outer = bounds.insetBy(dx: inset, dy: inset)
+            let inner = outer.insetBy(dx: step, dy: step)
+            let radius = max(0, RulerGeometry.cornerRadius - inset)
+
+            context.saveGState()
+            context.addPath(CGPath(roundedRect: outer, cornerWidth: radius,
+                                  cornerHeight: radius, transform: nil))
+            context.addPath(CGPath(roundedRect: inner, cornerWidth: max(0, radius - step),
+                                  cornerHeight: max(0, radius - step), transform: nil))
+            context.clip(using: .evenOdd)
+            let shaded = 0.025 * exp(-depth / 0.65)
+            let lit = 0.105 * exp(-depth / 1.35)
+            gradient([.white.withAlphaComponent(shaded), .white.withAlphaComponent(lit)],
+                     locations: [0, 1])
+            context.restoreGState()
+        }
+
+        // Small radial glints live only on the corner rims. Their intensity
+        // changes continuously with rotation; there is no animated light source.
+        for sx: CGFloat in [-1, 1] {
+            for sy: CGFloat in [-1, 1] {
+                let facing = (sx * direction.x + sy * direction.y) / sqrt(2)
+                let strength = pow(max(0, facing), 4) + 0.3 * pow(max(0, -facing), 4)
+                let corner = CGPoint(x: sx < 0 ? RulerGeometry.cornerRadius : bounds.width - RulerGeometry.cornerRadius,
+                                     y: sy < 0 ? RulerGeometry.cornerRadius : bounds.height - RulerGeometry.cornerRadius)
+                let tint = facing >= 0
+                    ? NSColor(calibratedRed: 0.68, green: 0.86, blue: 1, alpha: 0.14 * strength)
+                    : NSColor(calibratedRed: 1, green: 0.81, blue: 0.68, alpha: 0.14 * strength)
+
+                context.saveGState()
+                context.addPath(CGPath(roundedRect: bounds.insetBy(dx: 1.05, dy: 1.05),
+                                      cornerWidth: RulerGeometry.cornerRadius - 1.05, cornerHeight: RulerGeometry.cornerRadius - 1.05, transform: nil))
+                context.setLineWidth(1.3)
+                context.replacePathWithStrokedPath()
+                context.clip()
+
+                let colors = [NSColor.white.withAlphaComponent(0.19 * strength).cgColor,
+                              tint.cgColor, tint.withAlphaComponent(0).cgColor] as CFArray
+                if let glint = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                                          colors: colors, locations: [0, 0.4, 1]) {
+                    context.drawRadialGradient(glint, startCenter: corner, startRadius: 0,
+                                               endCenter: corner, endRadius: 22, options: [])
+                }
+                context.restoreGState()
+            }
+        }
+    }
+
     override func draw(_ dirtyRect: NSRect) {
+        drawSurfaceOptics()
+        drawEdgeHighlight()
+
         let ticks = NSBezierPath()
         for value in stride(from: 0, through: Int(geometry.length), by: 5) {
             let x = CGFloat(value) + RulerGeometry.inset
@@ -275,14 +393,41 @@ private final class RulerMarkingsView: NSView {
         if isRotating { angleAttributes[.foregroundColor] = NSColor.systemBlue }
         angle.draw(at: NSPoint(x: origin + prefixWidth, y: 12), withAttributes: angleAttributes)
 
-        let grips = NSBezierPath()
-        for x in [CGFloat(7), 11, bounds.width - 11, bounds.width - 7] {
-            grips.move(to: NSPoint(x: x, y: 24))
-            grips.line(to: NSPoint(x: x, y: 43))
+        // Offset light beside each groove suggests an etched handle. Keep the
+        // measurement ticks and labels untouched for maximum legibility.
+        let lightAngle = (125 - geometry.angle) * .pi / 180
+        let offset = CGPoint(x: -cos(lightAngle) * 0.7, y: -sin(lightAngle) * 0.7)
+        let handleHeight: CGFloat = 19
+        let bottom = bounds.midY - handleHeight / 2 - offset.y / 2
+        let top = bottom + handleHeight
+
+        // Rounded grooves fade gently at both ends, keeping the combined etch
+        // centered rather than adding a hard rectangular cap to the handles.
+        func drawEtch(width: CGFloat, color: NSColor, offset: CGPoint) {
+            guard let context = NSGraphicsContext.current?.cgContext else { return }
+            context.saveGState()
+            defer { context.restoreGState() }
+
+            // The path contains only move/line segments; build its stroke mask.
+            for x in [CGFloat(7), 11, bounds.width - 11, bounds.width - 7] {
+                context.move(to: CGPoint(x: x + offset.x, y: bottom + offset.y))
+                context.addLine(to: CGPoint(x: x + offset.x, y: top + offset.y))
+            }
+            context.setLineWidth(width)
+            context.setLineCap(.round)
+            context.replacePathWithStrokedPath()
+            context.clip()
+
+            let colors = [color.withAlphaComponent(0).cgColor, color.cgColor,
+                          color.cgColor, color.withAlphaComponent(0).cgColor] as CFArray
+            guard let fade = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors,
+                                         locations: [0, 0.12, 0.88, 1]) else { return }
+            context.drawLinearGradient(fade, start: CGPoint(x: 0, y: bottom + offset.y),
+                end: CGPoint(x: 0, y: top + offset.y), options: [])
         }
-        NSColor(calibratedWhite: 0.55, alpha: 0.32).setStroke()
-        grips.lineWidth = 1
-        grips.stroke()
+
+        drawEtch(width: 0.75, color: .white.withAlphaComponent(0.28), offset: offset)
+        drawEtch(width: 0.8, color: NSColor(calibratedWhite: 0.35, alpha: 0.36), offset: .zero)
     }
 }
 
