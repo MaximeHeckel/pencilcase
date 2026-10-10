@@ -55,6 +55,7 @@ final class RulerController: ObservableObject {
     }
 
     func resetPosition() {
+        (panel?.contentView as? RulerView)?.cancelInteraction()
         guard let panel else { return }
         let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }
             ?? NSScreen.main

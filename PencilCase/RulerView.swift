@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 
 /// The transparent host expands to enclose the rotated glass instrument.
 final class RulerView: NSView {
@@ -6,10 +7,18 @@ final class RulerView: NSView {
     private let markings = RulerMarkingsView()
     private(set) var geometry = RulerGeometry()
     private var gesture: Gesture?
+    private var motionTimer: Timer?
+    private var motion: RulerMomentum?
+    private var motionLimits = CGRect.zero
+    private var motionOrigin = CGPoint.zero
+    private var lastMotionTime: TimeInterval = 0
+    private var motionStarted: TimeInterval = 0
+    private var dragSamples: [(point: CGPoint, time: TimeInterval)] = []
     private var dragCursor: NSCursor?
     fileprivate var isInteracting = false
 
     private struct Gesture {
+        var moving: Bool
         var startMouse: CGPoint
         var center: CGPoint
         var initial: RulerGeometry
@@ -22,6 +31,8 @@ final class RulerView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         glass.style = .clear
+        // This instrument is pale acrylic even when the surrounding app is dark.
+        glass.appearance = NSAppearance(named: .aqua)
         glass.cornerRadius = RulerGeometry.cornerRadius
         glass.contentView = markings
         markings.owner = self
@@ -38,20 +49,23 @@ final class RulerView: NSView {
     }
 
     func resetGeometry() {
+        cancelInteraction()
         geometry = RulerGeometry()
         applyGeometry(center: screenCenter)
     }
 
     private var screenCenter: CGPoint {
         guard let window else { return .zero }
-        return CGPoint(x: window.frame.midX, y: window.frame.midY)
+        let localCenter = CGPoint(x: glass.bounds.midX, y: glass.bounds.midY)
+        return window.convertPoint(toScreen: glass.convert(localCenter, to: nil))
     }
 
-    private func layoutInstrument() {
+    private func layoutInstrument(center: CGPoint? = nil) {
+        let center = center ?? CGPoint(x: bounds.midX, y: bounds.midY)
         // Reset the transform before changing size; ticks must never stretch.
         glass.frameCenterRotation = 0
-        glass.frame = NSRect(x: (bounds.width - geometry.width) / 2,
-                             y: (bounds.height - RulerGeometry.height) / 2,
+        glass.frame = NSRect(x: center.x - geometry.width / 2,
+                             y: center.y - RulerGeometry.height / 2,
                              width: geometry.width, height: RulerGeometry.height)
         glass.bounds = NSRect(origin: .zero, size: NSSize(width: geometry.width, height: RulerGeometry.height))
         markings.frame = glass.bounds
@@ -63,31 +77,39 @@ final class RulerView: NSView {
     }
 
     private func applyGeometry(center: CGPoint) {
+        // Commit the window resize and glass transform together, without implicit
+        // material animations between the temporary unrotated and final frames.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
         let size = geometry.enclosingSize
         window?.setFrame(NSRect(x: center.x - size.width / 2, y: center.y - size.height / 2,
-                                width: size.width, height: size.height), display: false)
-        layoutInstrument()
-        window?.invalidateShadow()
+                                width: size.width, height: size.height), display: false, animate: false)
+
+        // AppKit may align the window frame to pixels. Compensate inside it so
+        // the rotation pivot / opposite resize endpoint does not wobble.
+        let localCenter = window.map { convert($0.convertPoint(fromScreen: center), from: nil) }
+        layoutInstrument(center: localCenter)
         needsDisplay = true
     }
 
     fileprivate func begin(_ event: NSEvent, location: CGPoint) {
+        stopMotion()
         isInteracting = true
+        dragSamples.removeAll()
         markings.clearMeasurementHover()
         let rotating = event.modifierFlags.contains(.option)
         markings.isRotating = rotating
         let end: CGFloat? = location.x < 18 ? -1 : (location.x > geometry.width - 18 ? 1 : nil)
-        guard rotating || end != nil else {
-            window?.performDrag(with: event)
-            isInteracting = false
-            return
-        }
+        markings.isResizing = !rotating && end != nil
         let mouse = NSEvent.mouseLocation
         let center = screenCenter
-        gesture = Gesture(startMouse: mouse, center: center, initial: geometry,
+        gesture = Gesture(moving: !rotating && end == nil, startMouse: mouse, center: center, initial: geometry,
                           resizeEnd: rotating ? nil : end,
                           lastPointerAngle: atan2(mouse.y - center.y, mouse.x - center.x))
-        let cursor = rotating ? RulerCursors.rotate : RulerCursors.resize(angle: geometry.angle)
+        if gesture?.moving == true { dragSamples = [(mouse, event.timestamp)] }
+        let cursor: NSCursor = rotating ? RulerCursors.rotate : (end == nil ? .closedHand : RulerCursors.resize(angle: geometry.angle))
         dragCursor = cursor
         window?.disableCursorRects()
         cursor.push()
@@ -97,9 +119,19 @@ final class RulerView: NSView {
         guard var gesture else { return }
         dragCursor?.set()
         let mouse = NSEvent.mouseLocation
-        if let end = gesture.resizeEnd {
+        if gesture.moving {
+            let center = CGPoint(x: gesture.center.x + mouse.x - gesture.startMouse.x,
+                                 y: gesture.center.y + mouse.y - gesture.startMouse.y)
+            if let window {
+                window.setFrameOrigin(CGPoint(x: center.x - window.frame.width / 2,
+                                              y: center.y - window.frame.height / 2))
+            }
+            dragSamples.append((mouse, event.timestamp))
+            dragSamples.removeAll { event.timestamp - $0.time > 0.09 }
+        } else if let end = gesture.resizeEnd {
             let change = gesture.initial.resized(
                 delta: CGPoint(x: mouse.x - gesture.startMouse.x, y: mouse.y - gesture.startMouse.y), end: end)
+            guard change.geometry.length != geometry.length else { return }
             geometry = change.geometry
             applyGeometry(center: CGPoint(x: gesture.center.x + change.centerOffset.x,
                                           y: gesture.center.y + change.centerOffset.y))
@@ -120,15 +152,19 @@ final class RulerView: NSView {
                 NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
             }
             self.gesture = gesture
-            geometry.angle = RulerGeometry.signedAngle(resolved)
+            let angle = RulerGeometry.signedAngle(resolved)
+            guard angle != geometry.angle else { return }
+            geometry.angle = angle
             applyGeometry(center: gesture.center)
         }
         dragCursor?.set()
     }
 
-    fileprivate func end() {
+    fileprivate func end(allowMomentum: Bool = false) {
+        let wasMoving = gesture?.moving == true
         isInteracting = false
         markings.isRotating = false
+        markings.isResizing = false
         guard gesture != nil else { return }
         gesture = nil
         dragCursor = nil
@@ -136,15 +172,90 @@ final class RulerView: NSView {
         window?.enableCursorRects()
         window?.invalidateCursorRects(for: markings)
         NSCursor.arrow.set()
+        if allowMomentum && wasMoving { startMotion() }
+        dragSamples.removeAll()
+    }
+
+    private var momentumEnabled: Bool {
+        (UserDefaults.standard.object(forKey: "rulerMomentumEnabled") as? Bool ?? true)
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private func startMotion() {
+        guard momentumEnabled, let window, let first = dragSamples.first,
+              let last = dragSamples.last, last.time - first.time >= 0.015,
+              ProcessInfo.processInfo.systemUptime - last.time < 0.08 else { return }
+
+        let elapsed = last.time - first.time
+        var velocity = CGPoint(x: (last.point.x - first.point.x) / elapsed,
+                               y: (last.point.y - first.point.y) / elapsed)
+        let speed = hypot(velocity.x, velocity.y)
+        guard speed > 450 else { return }
+        let factor = min(1, 2200 / speed)
+        velocity.x *= factor
+        velocity.y *= factor
+
+        // Keep the throw on the display containing most of the ruler at release.
+        guard let screen = NSScreen.screens.max(by: {
+            let a = $0.visibleFrame.intersection(window.frame)
+            let b = $1.visibleFrame.intersection(window.frame)
+            return a.width * a.height < b.width * b.height
+        }) else { return }
+        motionLimits = screen.visibleFrame
+        motionOrigin = window.frame.origin
+        motion = RulerMomentum(velocity: velocity)
+        isInteracting = true
+        lastMotionTime = ProcessInfo.processInfo.systemUptime
+        motionStarted = lastMotionTime
+
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.advanceMotion() }
+        }
+        motionTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func advanceMotion() {
+        guard gesture == nil, momentumEnabled, let window, window.isVisible, var motion else {
+            stopMotion()
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = now - lastMotionTime
+        guard dt < 0.1, now - motionStarted < 1.8 else {
+            stopMotion()
+            return
+        }
+        lastMotionTime = now
+        // Never feed AppKit's pixel-aligned frame back into the integrator:
+        // fractional movement must accumulate equally on both axes.
+        motionOrigin = motion.step(origin: motionOrigin, size: window.frame.size,
+                                   limits: motionLimits, dt: dt)
+        window.setFrameOrigin(motionOrigin)
+        self.motion = motion
+        if motion.isStopped { stopMotion() }
+    }
+
+    private func stopMotion() {
+        motionTimer?.invalidate()
+        motionTimer = nil
+        motion = nil
+        isInteracting = false
     }
 
     func cancelInteraction() {
+        stopMotion()
         end()
         markings.clearMeasurementHover()
     }
 }
 
 private final class RulerMarkingsView: NSView {
+    private let interactionBlue = NSColor.systemBlue
+    var isResizing = false {
+        didSet { if oldValue != isResizing { needsDisplay = true } }
+    }
+
     weak var owner: RulerView?
     var geometry = RulerGeometry() {
         didSet {
@@ -198,15 +309,14 @@ private final class RulerMarkingsView: NSView {
         super.init(frame: frameRect)
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
-        toolTip = "Drag to move · Drag either end to resize · Option-drag to rotate · Snaps near 45° increments · Shift forces snapping"
-        setAccessibilityHelp(toolTip)
+        setAccessibilityHelp("Drag to move · Drag either end to resize · Option-drag to rotate · Snaps near 45° increments · Shift forces snapping")
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) { owner?.begin(event, location: convert(event.locationInWindow, from: nil)) }
     override func mouseDragged(with event: NSEvent) { owner?.update(event) }
-    override func mouseUp(with event: NSEvent) { owner?.end() }
+    override func mouseUp(with event: NSEvent) { owner?.end(allowMomentum: true) }
 
     override func resetCursorRects() {
         addCursorRect(bounds.insetBy(dx: 18, dy: 0), cursor: .openHand)
@@ -238,7 +348,7 @@ private final class RulerMarkingsView: NSView {
 
         let colors = [NSColor.white.withAlphaComponent(0.035).cgColor,
                       NSColor.white.withAlphaComponent(0.10).cgColor,
-                      NSColor.white.withAlphaComponent(0.38).cgColor] as CFArray
+                      NSColor.white.withAlphaComponent(0.55).cgColor] as CFArray
         guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
                                         colors: colors, locations: [0, 0.55, 1]) else { return }
 
@@ -272,14 +382,14 @@ private final class RulerMarkingsView: NSView {
                               cornerWidth: RulerGeometry.cornerRadius - 0.8, cornerHeight: RulerGeometry.cornerRadius - 0.8, transform: nil))
         context.clip()
         gradient([.white.withAlphaComponent(0), .white.withAlphaComponent(0),
-                  .white.withAlphaComponent(0.055), .white.withAlphaComponent(0)],
+                  .white.withAlphaComponent(0.07), .white.withAlphaComponent(0)],
                  locations: [0, 0.28, 0.62, 1])
         context.restoreGState()
 
         // Adjacent filled bands approximate a continuous falloff without the
         // gaps of concentric strokes. The lit side has a wider, softer shoulder.
         let step: CGFloat = 0.25
-        for index in 0..<16 {
+        for index in 0..<40 {
             let inset = 0.9 + CGFloat(index) * step
             let depth = CGFloat(index) * step
             let outer = bounds.insetBy(dx: inset, dy: inset)
@@ -292,10 +402,27 @@ private final class RulerMarkingsView: NSView {
             context.addPath(CGPath(roundedRect: inner, cornerWidth: max(0, radius - step),
                                   cornerHeight: max(0, radius - step), transform: nil))
             context.clip(using: .evenOdd)
-            let shaded = 0.025 * exp(-depth / 0.65)
-            let lit = 0.105 * exp(-depth / 1.35)
+            let shaded = 0.035 * exp(-depth / 1.625)
+            let lit = 0.15 * exp(-depth / 3.375)
             gradient([.white.withAlphaComponent(shaded), .white.withAlphaComponent(lit)],
                      locations: [0, 1])
+
+            // Give both long edges a steady reflection beneath the ticks.
+            // Keep the side rims and corner glints at their existing intensity.
+            let edgeStart = bounds.minX + RulerGeometry.cornerRadius
+            let edgeEnd = bounds.maxX - RulerGeometry.cornerRadius
+            context.clip(to: CGRect(x: edgeStart, y: bounds.minY,
+                                    width: edgeEnd - edgeStart, height: bounds.height))
+            let base = NSColor.white.withAlphaComponent(0.10 * exp(-depth / 3.375))
+            let colors = [base.withAlphaComponent(0).cgColor, base.cgColor,
+                          base.cgColor, base.withAlphaComponent(0).cgColor] as CFArray
+            let fade = min(0.1, 10 / (edgeEnd - edgeStart))
+            if let reflection = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: colors, locations: [0, fade, 1 - fade, 1]) {
+                context.drawLinearGradient(reflection,
+                    start: CGPoint(x: edgeStart, y: bounds.midY),
+                    end: CGPoint(x: edgeEnd, y: bounds.midY), options: [])
+            }
             context.restoreGState()
         }
 
@@ -312,18 +439,18 @@ private final class RulerMarkingsView: NSView {
                     : NSColor(calibratedRed: 1, green: 0.81, blue: 0.68, alpha: 0.14 * strength)
 
                 context.saveGState()
-                context.addPath(CGPath(roundedRect: bounds.insetBy(dx: 1.05, dy: 1.05),
-                                      cornerWidth: RulerGeometry.cornerRadius - 1.05, cornerHeight: RulerGeometry.cornerRadius - 1.05, transform: nil))
-                context.setLineWidth(1.3)
+                context.addPath(CGPath(roundedRect: bounds.insetBy(dx: 1.6, dy: 1.6),
+                                      cornerWidth: RulerGeometry.cornerRadius - 1.6, cornerHeight: RulerGeometry.cornerRadius - 1.6, transform: nil))
+                context.setLineWidth(2.4)
                 context.replacePathWithStrokedPath()
                 context.clip()
 
-                let colors = [NSColor.white.withAlphaComponent(0.19 * strength).cgColor,
+                let colors = [NSColor.white.withAlphaComponent(0.28 * strength).cgColor,
                               tint.cgColor, tint.withAlphaComponent(0).cgColor] as CFArray
                 if let glint = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
                                           colors: colors, locations: [0, 0.4, 1]) {
                     context.drawRadialGradient(glint, startCenter: corner, startRadius: 0,
-                                               endCenter: corner, endRadius: 22, options: [])
+                                               endCenter: corner, endRadius: 30, options: [])
                 }
                 context.restoreGState()
             }
@@ -331,6 +458,11 @@ private final class RulerMarkingsView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        // A luminous white body supports charcoal ink over varied desktop content.
+        NSColor.white.withAlphaComponent(0.24).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: RulerGeometry.cornerRadius,
+                     yRadius: RulerGeometry.cornerRadius).fill()
+
         drawSurfaceOptics()
         drawEdgeHighlight()
 
@@ -345,14 +477,14 @@ private final class RulerMarkingsView: NSView {
                 let label = "\(value)" as NSString
                 let attributes: [NSAttributedString.Key: Any] = [
                     .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium),
-                    .foregroundColor: NSColor.labelColor
+                    .foregroundColor: NSColor(calibratedWhite: 0.16, alpha: 1)
                 ]
                 let size = label.size(withAttributes: attributes)
                 label.draw(at: NSPoint(x: x - size.width / 2, y: 39), withAttributes: attributes)
             }
         }
-        NSColor.labelColor.withAlphaComponent(0.7).setStroke()
-        ticks.lineWidth = 0.75
+        NSColor(calibratedWhite: 0.16, alpha: 0.8).setStroke()
+        ticks.lineWidth = 1.0
         ticks.stroke()
 
         if let hoveredPoint {
@@ -361,37 +493,48 @@ private final class RulerMarkingsView: NSView {
             indicator.move(to: NSPoint(x: x, y: bounds.height))
             indicator.line(to: NSPoint(x: x, y: 0))
             indicator.lineWidth = 1
-            NSColor.systemBlue.setStroke()
+            interactionBlue.setStroke()
             indicator.stroke()
         }
 
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: NSColor.secondaryLabelColor
+            .foregroundColor: NSColor(calibratedWhite: 0.22, alpha: 1)
         ]
-        // Preserve the original compact baseline and spacing. Only the angle
-        // reserves space for the sign, three integer digits and two fractional digits.
-        let prefix = "\(Int(hoveredPoint ?? geometry.length)) pt · " as NSString
-        let prefixTemplate = "\(Int(geometry.length)) pt · " as NSString
+        // Reserve both pill slots permanently, including the maximum length and
+        // signed angle. Activation changes paint only, never text or group layout.
+        let padding: CGFloat = 4
+        let valueGap: CGFloat = 14
+        let points = "\(Int(hoveredPoint ?? geometry.length)) pt" as NSString
         let angle = (geometry.angleText + "°") as NSString
-        let prefixWidth = prefixTemplate.size(withAttributes: attributes).width
-        let angleWidth = [CGFloat(-180), 180].map {
-            ((RulerGeometry(angle: $0).angleText + "°") as NSString).size(withAttributes: attributes).width
-        }.max() ?? 0
-        let origin = (bounds.width - prefixWidth - angleWidth) / 2
-        // Reserve the full-length field so shorter hover values do not move
-        // the units, separator, or angle readout.
-        let prefixOffset = prefixWidth - prefix.size(withAttributes: attributes).width
-        let styledPrefix = NSMutableAttributedString(string: prefix as String, attributes: attributes)
-        if hoveredPoint != nil {
-            // Match the hover line; keep the separator and angle neutral.
-            styledPrefix.addAttribute(.foregroundColor, value: NSColor.systemBlue,
-                                      range: NSRange(location: 0, length: prefix.length - 3))
+        let pointWidth = ("2000 pt" as NSString).size(withAttributes: attributes).width + padding * 2
+        let angleWidth = ["+180.00°", "−180.00°"].map {
+            ($0 as NSString).size(withAttributes: attributes).width
+        }.max()! + padding * 2
+        let slotWidth = max(pointWidth, angleWidth)
+        let origin = (bounds.width - slotWidth * 2 - valueGap) / 2
+        let pillY: CGFloat = 8
+        let pillHeight: CGFloat = 21
+        let textY = pillY + (pillHeight - ("0000 pt" as NSString).size(withAttributes: attributes).height) / 2
+
+        func drawValue(_ text: NSString, x: CGFloat, width: CGFloat, active: Bool) {
+            let pill = NSRect(x: x, y: pillY, width: width, height: pillHeight)
+            var ink = attributes
+            let fill = active ? interactionBlue : NSColor(calibratedWhite: 0.78, alpha: 0.40)
+            fill.setFill()
+            NSBezierPath(roundedRect: pill, xRadius: pill.height / 2,
+                         yRadius: pill.height / 2).fill()
+            if active { ink[.foregroundColor] = NSColor.white }
+            let textWidth = text.size(withAttributes: attributes).width
+            text.draw(at: NSPoint(x: pill.midX - textWidth / 2, y: textY), withAttributes: ink)
         }
-        styledPrefix.draw(at: NSPoint(x: origin + prefixOffset, y: 12))
-        var angleAttributes = attributes
-        if isRotating { angleAttributes[.foregroundColor] = NSColor.systemBlue }
-        angle.draw(at: NSPoint(x: origin + prefixWidth, y: 12), withAttributes: angleAttributes)
+
+        drawValue(points, x: origin, width: slotWidth, active: hoveredPoint != nil || isResizing)
+        let separator = "·" as NSString
+        let separatorWidth = separator.size(withAttributes: attributes).width
+        separator.draw(at: NSPoint(x: origin + slotWidth + (valueGap - separatorWidth) / 2,
+                                   y: textY), withAttributes: attributes)
+        drawValue(angle, x: origin + slotWidth + valueGap, width: slotWidth, active: isRotating)
 
         // Offset light beside each groove suggests an etched handle. Keep the
         // measurement ticks and labels untouched for maximum legibility.
@@ -427,7 +570,7 @@ private final class RulerMarkingsView: NSView {
         }
 
         drawEtch(width: 0.75, color: .white.withAlphaComponent(0.28), offset: offset)
-        drawEtch(width: 0.8, color: NSColor(calibratedWhite: 0.35, alpha: 0.36), offset: .zero)
+        drawEtch(width: 0.8, color: NSColor(calibratedWhite: 0.16, alpha: 0.5), offset: .zero)
     }
 }
 

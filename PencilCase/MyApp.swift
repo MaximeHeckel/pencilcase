@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct PencilCaseApp: App {
+    @AppStorage("rulerMomentumEnabled") private var momentumEnabled = true
     @StateObject private var ruler = RulerController.shared
 
     var body: some Scene {
@@ -17,6 +18,7 @@ struct PencilCaseApp: App {
             }
 
             Divider()
+            Toggle("Momentum When Throwing", isOn: $momentumEnabled)
             Text("Drag ends to resize")
             Text("⌥ Drag to rotate · ⇧ to snap")
             Button("Reset Ruler Size and Angle") { ruler.resetSizeAndAngle() }
