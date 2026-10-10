@@ -3,11 +3,15 @@ import QuartzCore
 
 /// The transparent host expands to enclose the rotated glass instrument.
 final class RulerView: NSView {
+    private let instrument = NSView()
+    private var instrumentCenter = CGPoint.zero
+    private var hoverArea: NSTrackingArea?
     private let glass = NSGlassEffectView()
     private let markings = RulerMarkingsView()
     private(set) var geometry = RulerGeometry()
     private var gesture: Gesture?
     private var drawingAlongEdge = false
+    private var rotationEnvelope = false
     private var motionTimer: Timer?
     private var motion: RulerMomentum?
     private var motionLimits = CGRect.zero
@@ -39,38 +43,75 @@ final class RulerView: NSView {
         glass.cornerRadius = RulerGeometry.cornerRadius
         glass.contentView = markings
         markings.owner = self
-        addSubview(glass)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.image)
+        setAccessibilityHelp("Drag the body to move, drag ends to resize, Option-drag to rotate.")
+        wantsLayer = true
+        layer?.masksToBounds = false
+        instrument.wantsLayer = true
+        instrument.autoresizesSubviews = false
+        addSubview(instrument)
+        instrument.addSubview(glass)
         layoutInstrument()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    private func instrumentToHost(_ point: CGPoint) -> CGPoint {
+        let x = point.x - geometry.width / 2
+        let y = point.y - RulerGeometry.height / 2
+        let c = cos(geometry.radians), s = sin(geometry.radians)
+        return CGPoint(x: instrumentCenter.x + c * x - s * y,
+                       y: instrumentCenter.y + s * x + c * y)
+    }
+
+    private func hostToInstrument(_ point: CGPoint) -> CGPoint {
+        let x = point.x - instrumentCenter.x, y = point.y - instrumentCenter.y
+        let c = cos(geometry.radians), s = sin(geometry.radians)
+        return CGPoint(x: geometry.width / 2 + c * x + s * y,
+                       y: RulerGeometry.height / 2 - s * x + c * y)
+    }
+
+    fileprivate func instrumentPoint(from windowPoint: CGPoint) -> CGPoint {
+        hostToInstrument(convert(windowPoint, from: nil))
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
-        // Only the actual instrument participates in AppKit hit testing.
-        let local = markings.convert(point, from: superview)
-        return markings.bounds.contains(local) ? markings : nil
+        let local = hostToInstrument(convert(point, from: superview))
+        return glass.bounds.contains(local) ? self : nil
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { begin(event, location: instrumentPoint(from: event.locationInWindow)) }
+    override func mouseDragged(with event: NSEvent) { update(event) }
+    override func mouseUp(with event: NSEvent) { end(allowMomentum: true) }
+    override func mouseMoved(with event: NSEvent) { markings.updateMeasurementHover(event) }
+    override func mouseEntered(with event: NSEvent) { markings.updateMeasurementHover(event) }
+    override func mouseExited(with event: NSEvent) { markings.clearMeasurementHover() }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        hoverArea = area
     }
 
     var markingExclusionPath: CGPath? {
         guard let window else { return nil }
         func screen(_ p: CGPoint) -> CGPoint {
-            window.convertPoint(toScreen: glass.convert(p, to: nil))
+            window.convertPoint(toScreen: convert(instrumentToHost(p), to: nil))
         }
-        let origin = screen(.zero)
-        let x = screen(CGPoint(x: 1, y: 0))
-        let y = screen(CGPoint(x: 0, y: 1))
+        let origin = screen(.zero), x = screen(CGPoint(x: 1, y: 0)), y = screen(CGPoint(x: 0, y: 1))
         var transform = CGAffineTransform(a: x.x - origin.x, b: x.y - origin.y,
-                                         c: y.x - origin.x, d: y.y - origin.y,
-                                         tx: origin.x, ty: origin.y)
-        let path = CGPath(roundedRect: glass.bounds, cornerWidth: RulerGeometry.cornerRadius,
-                          cornerHeight: RulerGeometry.cornerRadius, transform: nil)
-        return path.copy(using: &transform)
+                                         c: y.x - origin.x, d: y.y - origin.y, tx: origin.x, ty: origin.y)
+        return CGPath(roundedRect: glass.bounds, cornerWidth: RulerGeometry.cornerRadius,
+                      cornerHeight: RulerGeometry.cornerRadius, transform: nil).copy(using: &transform)
     }
 
     var markingGuides: [MarkerGuide] {
         guard let window else { return [] }
-        func screen(_ point: CGPoint) -> CGPoint {
-            window.convertPoint(toScreen: glass.convert(point, to: nil))
+        func screen(_ p: CGPoint) -> CGPoint {
+            window.convertPoint(toScreen: convert(instrumentToHost(p), to: nil))
         }
         return [CGFloat(0), RulerGeometry.height].map { y in
             MarkerGuide(start: screen(CGPoint(x: RulerGeometry.inset, y: y)),
@@ -86,25 +127,35 @@ final class RulerView: NSView {
 
     private var screenCenter: CGPoint {
         guard let window else { return .zero }
-        let localCenter = CGPoint(x: glass.bounds.midX, y: glass.bounds.midY)
-        return window.convertPoint(toScreen: glass.convert(localCenter, to: nil))
+        return window.convertPoint(toScreen: convert(instrumentCenter, to: nil))
     }
 
     private func layoutInstrument(center: CGPoint? = nil) {
-        let center = center ?? CGPoint(x: bounds.midX, y: bounds.midY)
-        // Reset the transform before changing size; ticks must never stretch.
-        glass.frameCenterRotation = 0
-        glass.frame = NSRect(x: center.x - geometry.width / 2,
-                             y: center.y - RulerGeometry.height / 2,
-                             width: geometry.width, height: RulerGeometry.height)
-        glass.bounds = NSRect(origin: .zero, size: NSSize(width: geometry.width, height: RulerGeometry.height))
+        instrumentCenter = center ?? CGPoint(x: bounds.midX, y: bounds.midY)
+        let size = CGSize(width: geometry.width, height: RulerGeometry.height)
+        layer?.sublayerTransform = CATransform3DIdentity
+        instrument.frame = CGRect(x: instrumentCenter.x - size.width / 2,
+                                  y: instrumentCenter.y - size.height / 2, width: size.width, height: size.height)
+        instrument.bounds = CGRect(origin: .zero, size: size)
+        glass.frame = instrument.bounds
+        glass.bounds = instrument.bounds
         markings.frame = glass.bounds
         markings.bounds = glass.bounds
         markings.geometry = geometry
-        glass.frameCenterRotation = geometry.angle
+        setAccessibilityLabel("Ruler, \(Int(geometry.length)) points, \(geometry.angleText) degrees")
+        // Rotate only the compositor layer. AppKit's layout tree stays axis aligned,
+        // avoiding its singular frame conversion at 45-degree diagonal angles.
+        // Finish AppKit geometry synchronization before applying our compositor transform.
+        layoutSubtreeIfNeeded()
+        layer?.sublayerTransform = CATransform3DMakeAffineTransform(rotationTransform)
         markings.needsDisplay = true
         MarkerController.shared.rulerDidChange()
-        window?.invalidateCursorRects(for: markings)
+    }
+
+    func moveWindow(to origin: CGPoint) {
+        guard let window, origin.x.isFinite, origin.y.isFinite else { return }
+        window.setFrameOrigin(origin)
+        MarkerController.shared.rulerDidChange()
     }
 
     private func applyGeometry(center: CGPoint) {
@@ -114,11 +165,8 @@ final class RulerView: NSView {
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
 
-        // AppKit may resize the view tree during setFrame. At diagonal angles,
-        // resizing a still-rotated glass view can produce invalid view geometry.
-        // Remove the transform first, then restore it within this same transaction.
-        glass.frameCenterRotation = 0
-        let size = geometry.enclosingSize
+        let span = ceil(hypot(geometry.width, RulerGeometry.height)) + 4
+        let size = rotationEnvelope ? CGSize(width: span, height: span) : geometry.enclosingSize
         window?.setFrame(NSRect(x: center.x - size.width / 2, y: center.y - size.height / 2,
                                 width: size.width, height: size.height), display: false, animate: false)
 
@@ -159,6 +207,10 @@ final class RulerView: NSView {
         gesture = Gesture(moving: !rotating && end == nil, startMouse: mouse, center: center, initial: geometry,
                           resizeEnd: rotating ? nil : end,
                           lastPointerAngle: atan2(mouse.y - center.y, mouse.x - center.x))
+        if rotating {
+            rotationEnvelope = true
+            applyGeometry(center: center)
+        }
         if gesture?.moving == true { dragSamples = [(mouse, event.timestamp)] }
         let cursor: NSCursor = rotating ? RulerCursors.rotate : (end == nil ? .closedHand : RulerCursors.resize(angle: geometry.angle))
         dragCursor = cursor
@@ -179,7 +231,7 @@ final class RulerView: NSView {
             let center = CGPoint(x: gesture.center.x + mouse.x - gesture.startMouse.x,
                                  y: gesture.center.y + mouse.y - gesture.startMouse.y)
             if let window {
-                window.setFrameOrigin(CGPoint(x: center.x - window.frame.width / 2,
+                moveWindow(to: CGPoint(x: center.x - window.frame.width / 2,
                                               y: center.y - window.frame.height / 2))
             }
             MarkerController.shared.rulerDidChange()
@@ -212,9 +264,28 @@ final class RulerView: NSView {
             let angle = RulerGeometry.signedAngle(resolved)
             guard angle != geometry.angle else { return }
             geometry.angle = angle
-            applyGeometry(center: gesture.center)
+            updateRotationLayers()
         }
         dragCursor?.set()
+    }
+
+    private var rotationTransform: CGAffineTransform {
+        let c = cos(geometry.radians), s = sin(geometry.radians)
+        let x = instrumentCenter.x, y = instrumentCenter.y
+        // Transform the host sublayers, leaving AppKit-owned view transforms alone.
+        return CGAffineTransform(a: c, b: s, c: -s, d: c,
+                                 tx: x - c * x + s * y, ty: y - s * x - c * y)
+    }
+
+    private func updateRotationLayers() {
+        // The gesture window already encloses every rotation angle.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.sublayerTransform = CATransform3DMakeAffineTransform(rotationTransform)
+        markings.geometry = geometry
+        markings.needsDisplay = true
+        MarkerController.shared.rulerDidChange()
+        CATransaction.commit()
     }
 
     fileprivate func end(allowMomentum: Bool = false) {
@@ -224,6 +295,10 @@ final class RulerView: NSView {
             MarkerController.shared.finishStroke()
             NSCursor.pop()
             return
+        }
+        if rotationEnvelope {
+            rotationEnvelope = false
+            applyGeometry(center: screenCenter)
         }
         let wasMoving = gesture?.moving == true
         isInteracting = false
@@ -286,7 +361,7 @@ final class RulerView: NSView {
         // fractional movement must accumulate equally on both axes.
         motionOrigin = motion.step(origin: motionOrigin, size: window.frame.size,
                                    limits: motionLimits, dt: dt)
-        window.setFrameOrigin(motionOrigin)
+        moveWindow(to: motionOrigin)
         MarkerController.shared.rulerDidChange()
         self.motion = motion
         if motion.isStopped { stopMotion() }
@@ -320,35 +395,18 @@ private final class RulerMarkingsView: NSView {
         }
     }
 
-    private var hoverArea: NSTrackingArea?
     private var hoveredPoint: CGFloat?
     var isRotating = false {
         didSet { if oldValue != isRotating { needsDisplay = true } }
     }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let hoverArea { removeTrackingArea(hoverArea) }
-        // Track drawing feedback even when another app is active. This does not
-        // change the system cursor or activate the ruler's panel.
-        let area = NSTrackingArea(rect: .zero,
-                                 options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
-                                 owner: self, userInfo: nil)
-        addTrackingArea(area)
-        hoverArea = area
-    }
-
-    override func mouseEntered(with event: NSEvent) { updateMeasurementHover(event) }
-    override func mouseMoved(with event: NSEvent) { updateMeasurementHover(event) }
-    override func mouseExited(with event: NSEvent) { clearMeasurementHover() }
-
-    private func updateMeasurementHover(_ event: NSEvent) {
+    fileprivate func updateMeasurementHover(_ event: NSEvent) {
         guard owner?.isInteracting == false, NSEvent.pressedMouseButtons == 0,
               window?.isVisible == true else {
             clearMeasurementHover()
             return
         }
-        let local = convert(event.locationInWindow, from: nil)
+        let local = owner?.instrumentPoint(from: event.locationInWindow) ?? .zero
         let value = geometry.hoveredPoint(at: local)
         guard value != hoveredPoint else { return }
         hoveredPoint = value
@@ -361,26 +419,87 @@ private final class RulerMarkingsView: NSView {
         needsDisplay = true
     }
 
+    override var wantsUpdateLayer: Bool { true }
+
+    private var artworkSize = CGSize.zero
+    private var artworkScale: CGFloat = 0
+    private var artworkAngle: CGFloat?
+    private let readoutLayer = CALayer()
+    private let hoverLayer = CAShapeLayer()
+    private var readoutBitmap: NSBitmapImageRep?
+
+    private func bitmap(size: CGSize, scale: CGFloat) -> NSBitmapImageRep? {
+        NSBitmapImageRep(bitmapDataPlanes: nil,
+            pixelsWide: Int(ceil(size.width * scale)), pixelsHigh: Int(ceil(size.height * scale)),
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+            isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+    }
+
+    private func paint(_ bitmap: NSBitmapImageRep, scale: CGFloat, origin: CGPoint = .zero, drawing: () -> Void) {
+        guard let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        context.cgContext.clear(CGRect(x: 0, y: 0, width: bitmap.pixelsWide, height: bitmap.pixelsHigh))
+        context.cgContext.scaleBy(x: scale, y: scale)
+        context.cgContext.translateBy(x: -origin.x, y: -origin.y)
+        drawing()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    override func updateLayer() {
+        let scale = window?.backingScaleFactor ?? 2
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
+        // Retain the full-resolution face during rotation. Refresh directional
+        // highlights on release, and rebuild immediately for a new length/scale.
+        if artworkSize != bounds.size || artworkScale != scale || artworkAngle == nil
+            || (!isRotating && artworkAngle != geometry.angle) {
+            guard let image = bitmap(size: bounds.size, scale: scale) else { return }
+            paint(image, scale: scale) { drawStaticArtwork() }
+            layer?.contentsScale = scale
+            layer?.contents = image.cgImage
+            artworkSize = bounds.size
+            artworkScale = scale
+            artworkAngle = geometry.angle
+        }
+
+        let readoutRect = CGRect(x: bounds.midX - 85, y: 6, width: 170, height: 26)
+        if readoutBitmap == nil || readoutBitmap?.pixelsWide != Int(ceil(readoutRect.width * scale)) {
+            readoutBitmap = bitmap(size: readoutRect.size, scale: scale)
+        }
+        if let image = readoutBitmap {
+            paint(image, scale: scale, origin: readoutRect.origin) { drawReadout() }
+            readoutLayer.frame = readoutRect
+            readoutLayer.contentsScale = scale
+            readoutLayer.contents = image.cgImage
+        }
+        if let hoveredPoint {
+            let path = CGMutablePath()
+            let x = RulerGeometry.inset + hoveredPoint
+            path.move(to: CGPoint(x: x, y: 0))
+            path.addLine(to: CGPoint(x: x, y: bounds.height))
+            hoverLayer.path = path
+        } else { hoverLayer.path = nil }
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
+        layer?.addSublayer(readoutLayer)
+        layer?.addSublayer(hoverLayer)
+        hoverLayer.strokeColor = interactionBlue.cgColor
+        hoverLayer.lineWidth = 1
+
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
         setAccessibilityHelp("Drag to move · Drag either end to resize · Option-drag to rotate · Snaps near 45° increments · Shift forces snapping")
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) { owner?.begin(event, location: convert(event.locationInWindow, from: nil)) }
-    override func mouseDragged(with event: NSEvent) { owner?.update(event) }
-    override func mouseUp(with event: NSEvent) { owner?.end(allowMomentum: true) }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds.insetBy(dx: 18, dy: 0), cursor: .openHand)
-        let resizeCursor = RulerCursors.resize(angle: geometry.angle)
-        addCursorRect(NSRect(x: 0, y: 0, width: 18, height: bounds.height), cursor: resizeCursor)
-        addCursorRect(NSRect(x: bounds.width - 18, y: 0, width: 18, height: bounds.height), cursor: resizeCursor)
-    }
-
     private func drawEdgeHighlight() {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
 
@@ -513,7 +632,7 @@ private final class RulerMarkingsView: NSView {
         }
     }
 
-    override func draw(_ dirtyRect: NSRect) {
+    private func drawStaticArtwork() {
         // A luminous white body supports charcoal ink over varied desktop content.
         NSColor.white.withAlphaComponent(0.24).setFill()
         NSBezierPath(roundedRect: bounds, xRadius: RulerGeometry.cornerRadius,
@@ -543,16 +662,44 @@ private final class RulerMarkingsView: NSView {
         ticks.lineWidth = 1.0
         ticks.stroke()
 
-        if let hoveredPoint {
-            let x = RulerGeometry.inset + hoveredPoint
-            let indicator = NSBezierPath()
-            indicator.move(to: NSPoint(x: x, y: bounds.height))
-            indicator.line(to: NSPoint(x: x, y: 0))
-            indicator.lineWidth = 1
-            interactionBlue.setStroke()
-            indicator.stroke()
+        // Offset light beside each groove suggests an etched handle. Keep the
+        // measurement ticks and labels untouched for maximum legibility.
+        let lightAngle = (125 - geometry.angle) * .pi / 180
+        let offset = CGPoint(x: -cos(lightAngle) * 0.7, y: -sin(lightAngle) * 0.7)
+        let handleHeight: CGFloat = 19
+        let bottom = bounds.midY - handleHeight / 2 - offset.y / 2
+        let top = bottom + handleHeight
+
+        // Rounded grooves fade gently at both ends, keeping the combined etch
+        // centered rather than adding a hard rectangular cap to the handles.
+        func drawEtch(width: CGFloat, color: NSColor, offset: CGPoint) {
+            guard let context = NSGraphicsContext.current?.cgContext else { return }
+            context.saveGState()
+            defer { context.restoreGState() }
+
+            // The path contains only move/line segments; build its stroke mask.
+            for x in [CGFloat(7), 11, bounds.width - 11, bounds.width - 7] {
+                context.move(to: CGPoint(x: x + offset.x, y: bottom + offset.y))
+                context.addLine(to: CGPoint(x: x + offset.x, y: top + offset.y))
+            }
+            context.setLineWidth(width)
+            context.setLineCap(.round)
+            context.replacePathWithStrokedPath()
+            context.clip()
+
+            let colors = [color.withAlphaComponent(0).cgColor, color.cgColor,
+                          color.cgColor, color.withAlphaComponent(0).cgColor] as CFArray
+            guard let fade = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors,
+                                         locations: [0, 0.12, 0.88, 1]) else { return }
+            context.drawLinearGradient(fade, start: CGPoint(x: 0, y: bottom + offset.y),
+                end: CGPoint(x: 0, y: top + offset.y), options: [])
         }
 
+        drawEtch(width: 0.75, color: .white.withAlphaComponent(0.28), offset: offset)
+        drawEtch(width: 0.8, color: NSColor(calibratedWhite: 0.16, alpha: 0.5), offset: .zero)
+    }
+
+    private func drawReadout() {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
             .foregroundColor: NSColor(calibratedWhite: 0.22, alpha: 1)
@@ -592,42 +739,8 @@ private final class RulerMarkingsView: NSView {
                                    y: textY), withAttributes: attributes)
         drawValue(angle, x: origin + slotWidth + valueGap, width: slotWidth, active: isRotating)
 
-        // Offset light beside each groove suggests an etched handle. Keep the
-        // measurement ticks and labels untouched for maximum legibility.
-        let lightAngle = (125 - geometry.angle) * .pi / 180
-        let offset = CGPoint(x: -cos(lightAngle) * 0.7, y: -sin(lightAngle) * 0.7)
-        let handleHeight: CGFloat = 19
-        let bottom = bounds.midY - handleHeight / 2 - offset.y / 2
-        let top = bottom + handleHeight
-
-        // Rounded grooves fade gently at both ends, keeping the combined etch
-        // centered rather than adding a hard rectangular cap to the handles.
-        func drawEtch(width: CGFloat, color: NSColor, offset: CGPoint) {
-            guard let context = NSGraphicsContext.current?.cgContext else { return }
-            context.saveGState()
-            defer { context.restoreGState() }
-
-            // The path contains only move/line segments; build its stroke mask.
-            for x in [CGFloat(7), 11, bounds.width - 11, bounds.width - 7] {
-                context.move(to: CGPoint(x: x + offset.x, y: bottom + offset.y))
-                context.addLine(to: CGPoint(x: x + offset.x, y: top + offset.y))
-            }
-            context.setLineWidth(width)
-            context.setLineCap(.round)
-            context.replacePathWithStrokedPath()
-            context.clip()
-
-            let colors = [color.withAlphaComponent(0).cgColor, color.cgColor,
-                          color.cgColor, color.withAlphaComponent(0).cgColor] as CFArray
-            guard let fade = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors,
-                                         locations: [0, 0.12, 0.88, 1]) else { return }
-            context.drawLinearGradient(fade, start: CGPoint(x: 0, y: bottom + offset.y),
-                end: CGPoint(x: 0, y: top + offset.y), options: [])
-        }
-
-        drawEtch(width: 0.75, color: .white.withAlphaComponent(0.28), offset: offset)
-        drawEtch(width: 0.8, color: NSColor(calibratedWhite: 0.16, alpha: 0.5), offset: .zero)
     }
+
 }
 
 

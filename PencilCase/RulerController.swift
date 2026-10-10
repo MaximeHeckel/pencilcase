@@ -93,7 +93,7 @@ final class RulerController: ObservableObject {
         let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }
             ?? NSScreen.main
         guard let frame = screen?.visibleFrame else { return }
-        panel.setFrameOrigin(NSPoint(
+        (panel.contentView as? RulerView)?.moveWindow(to: NSPoint(
             x: frame.midX - panel.frame.width / 2,
             y: frame.midY - panel.frame.height / 2
         ))
