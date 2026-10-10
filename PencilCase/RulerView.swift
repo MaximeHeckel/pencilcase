@@ -12,6 +12,7 @@ final class RulerView: NSView {
     private var gesture: Gesture?
     private var drawingAlongEdge = false
     private var rotationEnvelope = false
+    private var resizeEnvelope: CGRect?
     private var motionTimer: Timer?
     private var motion: RulerMomentum?
     private var motionLimits = CGRect.zero
@@ -115,7 +116,9 @@ final class RulerView: NSView {
         }
         return [CGFloat(0), RulerGeometry.height].map { y in
             MarkerGuide(start: screen(CGPoint(x: RulerGeometry.inset, y: y)),
-                        end: screen(CGPoint(x: RulerGeometry.inset + geometry.length, y: y)))
+                        end: screen(CGPoint(x: RulerGeometry.inset + geometry.length, y: y)),
+                        outwardNormal: CGPoint(x: -sin(geometry.radians) * (y == 0 ? -1 : 1),
+                                               y: cos(geometry.radians) * (y == 0 ? -1 : 1)))
         }
     }
 
@@ -167,8 +170,11 @@ final class RulerView: NSView {
 
         let span = ceil(hypot(geometry.width, RulerGeometry.height)) + 4
         let size = rotationEnvelope ? CGSize(width: span, height: span) : geometry.enclosingSize
-        window?.setFrame(NSRect(x: center.x - size.width / 2, y: center.y - size.height / 2,
-                                width: size.width, height: size.height), display: false, animate: false)
+        let target = resizeEnvelope ?? CGRect(x: center.x - size.width / 2, y: center.y - size.height / 2,
+                                               width: size.width, height: size.height)
+        if window?.frame != target {
+            window?.setFrame(target, display: false, animate: false)
+        }
 
         // AppKit may align the window frame to pixels. Compensate inside it so
         // the rotation pivot / opposite resize endpoint does not wobble.
@@ -207,6 +213,10 @@ final class RulerView: NSView {
         gesture = Gesture(moving: !rotating && end == nil, startMouse: mouse, center: center, initial: geometry,
                           resizeEnd: rotating ? nil : end,
                           lastPointerAngle: atan2(mouse.y - center.y, mouse.x - center.x))
+        if !rotating, let end {
+            prepareResizeEnvelope(center: center, end: end)
+            applyGeometry(center: center)
+        }
         if rotating {
             rotationEnvelope = true
             applyGeometry(center: center)
@@ -269,6 +279,19 @@ final class RulerView: NSView {
         dragCursor?.set()
     }
 
+    private func prepareResizeEnvelope(center: CGPoint, end: CGFloat) {
+        var largest = geometry
+        largest.length = RulerGeometry.maximumLength
+        let shift = (largest.length - geometry.length) * end / 2
+        let farCenter = CGPoint(x: center.x + geometry.axis.x * shift,
+                                y: center.y + geometry.axis.y * shift)
+        let size = largest.enclosingSize
+        // The far endpoint can move anywhere in this temporary envelope. The
+        // opposite endpoint stays fixed. Release restores a tightly fitted window.
+        resizeEnvelope = CGRect(x: farCenter.x - size.width / 2, y: farCenter.y - size.height / 2,
+                                width: size.width, height: size.height).integral
+    }
+
     private var rotationTransform: CGAffineTransform {
         let c = cos(geometry.radians), s = sin(geometry.radians)
         let x = instrumentCenter.x, y = instrumentCenter.y
@@ -296,8 +319,9 @@ final class RulerView: NSView {
             NSCursor.pop()
             return
         }
-        if rotationEnvelope {
+        if rotationEnvelope || resizeEnvelope != nil {
             rotationEnvelope = false
+            resizeEnvelope = nil
             applyGeometry(center: screenCenter)
         }
         let wasMoving = gesture?.moving == true
@@ -424,6 +448,9 @@ private final class RulerMarkingsView: NSView {
     private var artworkSize = CGSize.zero
     private var artworkScale: CGFloat = 0
     private var artworkAngle: CGFloat?
+    private let ticksLayer = CALayer()
+    private var ticksLength: CGFloat?
+    private var ticksScale: CGFloat = 0
     private let readoutLayer = CALayer()
     private let hoverLayer = CAShapeLayer()
     private var readoutBitmap: NSBitmapImageRep?
@@ -455,7 +482,7 @@ private final class RulerMarkingsView: NSView {
 
         // Retain the full-resolution face during rotation. Refresh directional
         // highlights on release, and rebuild immediately for a new length/scale.
-        if artworkSize != bounds.size || artworkScale != scale || artworkAngle == nil
+        if (!isResizing && artworkSize != bounds.size) || artworkScale != scale || artworkAngle == nil
             || (!isRotating && artworkAngle != geometry.angle) {
             guard let image = bitmap(size: bounds.size, scale: scale) else { return }
             paint(image, scale: scale) { drawStaticArtwork() }
@@ -464,6 +491,23 @@ private final class RulerMarkingsView: NSView {
             artworkSize = bounds.size
             artworkScale = scale
             artworkAngle = geometry.angle
+            // Only the middle of the material stretches during live resizing.
+            // End caps and grips retain their physical width; ticks live separately.
+            let cap: CGFloat = min(40, bounds.width / 3)
+            layer?.contentsCenter = CGRect(x: cap / bounds.width, y: 0,
+                                          width: 1 - 2 * cap / bounds.width, height: 1)
+        }
+
+        if ticksLength != geometry.length || ticksScale != scale {
+            let rect = CGRect(x: 0, y: 34, width: bounds.width, height: bounds.height - 34)
+            if let image = bitmap(size: rect.size, scale: scale) {
+                paint(image, scale: scale, origin: rect.origin) { drawTicks() }
+                ticksLayer.frame = rect
+                ticksLayer.contentsScale = scale
+                ticksLayer.contents = image.cgImage
+                ticksLength = geometry.length
+                ticksScale = scale
+            }
         }
 
         let readoutRect = CGRect(x: bounds.midX - 85, y: 6, width: 170, height: 26)
@@ -489,6 +533,7 @@ private final class RulerMarkingsView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layerContentsRedrawPolicy = .onSetNeedsDisplay
+        layer?.addSublayer(ticksLayer)
         layer?.addSublayer(readoutLayer)
         layer?.addSublayer(hoverLayer)
         hoverLayer.strokeColor = interactionBlue.cgColor
@@ -531,6 +576,30 @@ private final class RulerMarkingsView: NSView {
             start: CGPoint(x: center.x - direction.x * reach, y: center.y - direction.y * reach),
             end: CGPoint(x: center.x + direction.x * reach, y: center.y + direction.y * reach),
             options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+    }
+
+    private func drawPerimeterShading() {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        // Soft depth around the entire inner bevel, inset from the bright rim.
+        // Adjacent bands fade on both sides rather than creating a dark outline.
+        let step: CGFloat = 0.25
+        for index in 0..<24 {
+            let depth = (CGFloat(index) + 0.5) * step
+            let inset = 1.5 + CGFloat(index) * step
+            let outer = bounds.insetBy(dx: inset, dy: inset)
+            let inner = outer.insetBy(dx: step, dy: step)
+            let radius = max(0, RulerGeometry.cornerRadius - inset)
+            let falloff = exp(-pow((depth - 2) / 1.8, 2))
+
+            context.saveGState()
+            context.addPath(CGPath(roundedRect: outer, cornerWidth: radius,
+                                  cornerHeight: radius, transform: nil))
+            context.addPath(CGPath(roundedRect: inner, cornerWidth: max(0, radius - step),
+                                  cornerHeight: max(0, radius - step), transform: nil))
+            context.setFillColor(NSColor(calibratedWhite: 0.28, alpha: 0.085 * falloff).cgColor)
+            context.drawPath(using: .eoFill)
+            context.restoreGState()
+        }
     }
 
     private func drawSurfaceOptics() {
@@ -638,29 +707,9 @@ private final class RulerMarkingsView: NSView {
         NSBezierPath(roundedRect: bounds, xRadius: RulerGeometry.cornerRadius,
                      yRadius: RulerGeometry.cornerRadius).fill()
 
+        drawPerimeterShading()
         drawSurfaceOptics()
         drawEdgeHighlight()
-
-        let ticks = NSBezierPath()
-        for value in stride(from: 0, through: Int(geometry.length), by: 5) {
-            let x = CGFloat(value) + RulerGeometry.inset
-            let major = value % 50 == 0
-            let height: CGFloat = major ? 19 : (value % 10 == 0 ? 12 : 7)
-            ticks.move(to: NSPoint(x: x, y: bounds.height - 1))
-            ticks.line(to: NSPoint(x: x, y: bounds.height - height))
-            if major {
-                let label = "\(value)" as NSString
-                let attributes: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium),
-                    .foregroundColor: NSColor(calibratedWhite: 0.16, alpha: 1)
-                ]
-                let size = label.size(withAttributes: attributes)
-                label.draw(at: NSPoint(x: x - size.width / 2, y: 39), withAttributes: attributes)
-            }
-        }
-        NSColor(calibratedWhite: 0.16, alpha: 0.8).setStroke()
-        ticks.lineWidth = 1.0
-        ticks.stroke()
 
         // Offset light beside each groove suggests an etched handle. Keep the
         // measurement ticks and labels untouched for maximum legibility.
@@ -697,6 +746,30 @@ private final class RulerMarkingsView: NSView {
 
         drawEtch(width: 0.75, color: .white.withAlphaComponent(0.28), offset: offset)
         drawEtch(width: 0.8, color: NSColor(calibratedWhite: 0.16, alpha: 0.5), offset: .zero)
+    }
+
+    private func drawTicks() {
+        let ticks = NSBezierPath()
+        for value in stride(from: 0, through: Int(geometry.length), by: 5) {
+            let x = CGFloat(value) + RulerGeometry.inset
+            let major = value % 50 == 0
+            let height: CGFloat = major ? 19 : (value % 10 == 0 ? 12 : 7)
+            ticks.move(to: NSPoint(x: x, y: bounds.height - 1))
+            ticks.line(to: NSPoint(x: x, y: bounds.height - height))
+            if major {
+                let label = "\(value)" as NSString
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium),
+                    .foregroundColor: NSColor(calibratedWhite: 0.16, alpha: 1)
+                ]
+                let size = label.size(withAttributes: attributes)
+                label.draw(at: NSPoint(x: x - size.width / 2, y: 39), withAttributes: attributes)
+            }
+        }
+        NSColor(calibratedWhite: 0.16, alpha: 0.8).setStroke()
+        ticks.lineWidth = 1.0
+        ticks.stroke()
+
     }
 
     private func drawReadout() {

@@ -4,6 +4,7 @@ import CoreGraphics
 struct MarkerGuide {
     let start: CGPoint
     let end: CGPoint
+    var outwardNormal: CGPoint = .zero
 
     func project(_ point: CGPoint) -> CGPoint {
         let dx = end.x - start.x
@@ -13,6 +14,12 @@ struct MarkerGuide {
 
         let t = min(1, max(0, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared))
         return CGPoint(x: start.x + dx * t, y: start.y + dy * t)
+    }
+
+    func strokePoint(_ point: CGPoint, width: CGFloat) -> CGPoint {
+        let edge = project(point)
+        return CGPoint(x: edge.x + outwardNormal.x * width / 2,
+                       y: edge.y + outwardNormal.y * width / 2)
     }
 
     func distance(to point: CGPoint) -> CGFloat {

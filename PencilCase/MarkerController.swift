@@ -207,14 +207,14 @@ final class MarkerController: NSObject, ObservableObject {
         guard isDrawing else { return }
         guide = RulerController.shared.markingGuides.min { $0.distance(to: point) < $1.distance(to: point) }
         if let candidate = guide, candidate.distance(to: point) > 12 { guide = nil }
-        current = Stroke(points: [guide?.project(point) ?? point], color: inkColor, width: CGFloat(strokeWidth),
+        current = Stroke(points: [guide?.strokePoint(point, width: CGFloat(strokeWidth)) ?? point], color: inkColor, width: CGFloat(strokeWidth),
                          excludedRuler: RulerController.shared.markingExclusionPath)
         refresh()
     }
 
     func continueStroke(at point: CGPoint) {
         guard var stroke = current else { return }
-        let point = guide?.project(point) ?? point
+        let point = guide?.strokePoint(point, width: stroke.width) ?? point
         if let last = stroke.points.last, hypot(point.x - last.x, point.y - last.y) < 0.5 { return }
         if guide != nil, stroke.points.count == 2 { stroke.points[1] = point }
         else { stroke.points.append(point) }
