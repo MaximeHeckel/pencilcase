@@ -1,49 +1,120 @@
 import Foundation
 import CoreGraphics
 
-/// Point-space motion, independent of rendering and display scale.
+/// Tabletop sliding in logical points. No rendering or window allocation here.
 struct RulerMomentum {
+    struct Surface {
+        let friction: CGFloat
+        let drag: CGFloat
+        let restitution: CGFloat
+        let tangentialRetention: CGFloat
+
+        static let ruler = Surface(friction: 900, drag: 1.3, restitution: 0.24, tangentialRetention: 0.78)
+        static let marker = Surface(friction: 600, drag: 0.9, restitution: 0.36, tangentialRetention: 0.86)
+    }
+
     var velocity: CGPoint
+    var surface: Surface = .ruler
 
-    mutating func step(origin: CGPoint, size: CGSize, limits: CGRect, dt: Double) -> CGPoint {
-        let friction = 3.75
-        let damping = exp(-friction * dt)
-        let travel = (1 - damping) / friction
-        var result = CGPoint(x: origin.x + velocity.x * travel,
-                             y: origin.y + velocity.y * travel)
-        velocity.x *= damping
-        velocity.y *= damping
+    /// Fit recent pointer motion instead of relying on two potentially noisy events.
+    /// A pause before release means placement, not a throw.
+    static func releaseVelocity(samples: [(point: CGPoint, time: TimeInterval)], now: TimeInterval) -> CGPoint? {
+        let recent = samples.filter { now - $0.time >= 0 && now - $0.time <= 0.09 }
+        guard let first = recent.first, let last = recent.last,
+              last.time - first.time >= 0.012, now - last.time < 0.07 else { return nil }
 
-        var collided = false
-
-        func confine(_ position: inout CGFloat, _ speed: inout CGFloat,
-                     lower: CGFloat, upper: CGFloat, length: CGFloat) {
-            guard upper - lower >= length else {
-                position = (lower + upper - length) / 2
-                speed = 0
-                return
-            }
-            if position < lower {
-                position = lower
-                speed = abs(speed)
-                collided = true
-            } else if position > upper - length {
-                position = upper - length
-                speed = -abs(speed)
-                collided = true
-            }
+        var weightSum: CGFloat = 0
+        var meanTime: CGFloat = 0
+        var meanPoint = CGPoint.zero
+        for sample in recent {
+            let weight = CGFloat(exp((sample.time - now) / 0.035))
+            let time = CGFloat(sample.time - now)
+            weightSum += weight
+            meanTime += time * weight
+            meanPoint.x += sample.point.x * weight
+            meanPoint.y += sample.point.y * weight
         }
+        meanTime /= weightSum
+        meanPoint.x /= weightSum
+        meanPoint.y /= weightSum
 
-        confine(&result.x, &velocity.x, lower: limits.minX, upper: limits.maxX, length: size.width)
-        confine(&result.y, &velocity.y, lower: limits.minY, upper: limits.maxY, length: size.height)
-        // Reflect the normal, then damp the whole vector once (also at corners).
-        // Damping only the normal changes the angle into an edge-skimming slide.
-        if collided {
-            velocity.x *= 0.22
-            velocity.y *= 0.22
+        var variance: CGFloat = 0
+        var covariance = CGPoint.zero
+        for sample in recent {
+            let weight = CGFloat(exp((sample.time - now) / 0.035))
+            let time = CGFloat(sample.time - now) - meanTime
+            variance += weight * time * time
+            covariance.x += weight * time * (sample.point.x - meanPoint.x)
+            covariance.y += weight * time * (sample.point.y - meanPoint.y)
         }
+        guard variance > 0.000001 else { return nil }
+
+        let freshness = CGFloat(exp(-max(0, now - last.time - 0.012) / 0.025))
+        var result = CGPoint(x: covariance.x / variance * freshness,
+                             y: covariance.y / variance * freshness)
+        let speed = hypot(result.x, result.y)
+        guard speed > 180 else { return nil }
+
+        let scale = min(1, 2800 / speed)
+        result.x *= scale
+        result.y *= scale
         return result
     }
 
-    var isStopped: Bool { hypot(velocity.x, velocity.y) < 18 }
+    mutating func step(origin: CGPoint, size: CGSize, limits: CGRect, dt: Double) -> CGPoint {
+        guard dt.isFinite, dt > 0 else { return origin }
+        var position = origin
+        var remaining = min(dt, 0.1)
+
+        // Small bounded steps make edge contacts consistent across timer rates.
+        while remaining > 0.000001 {
+            let interval = min(remaining, 1.0 / 240)
+            remaining -= interval
+            let speed = hypot(velocity.x, velocity.y)
+            if speed > 0 {
+                // Integrate dv/dt = -friction - drag*v exactly, up to rest.
+                let stopTime = log1p(speed * surface.drag / surface.friction) / surface.drag
+                let time = min(CGFloat(interval), stopTime)
+                let decay = exp(-surface.drag * time)
+                let travel = (speed + surface.friction / surface.drag) * (1 - decay) / surface.drag
+                    - surface.friction * time / surface.drag
+                position.x += velocity.x / speed * travel
+                position.y += velocity.y / speed * travel
+
+                let nextSpeed = max(0, (speed + surface.friction / surface.drag) * decay - surface.friction / surface.drag)
+                velocity.x *= nextSpeed / speed
+                velocity.y *= nextSpeed / speed
+            }
+
+            let restitution = surface.restitution
+            func confine(_ point: inout CGFloat, _ normal: inout CGFloat,
+                         lower: CGFloat, upper: CGFloat, length: CGFloat) -> Bool {
+                guard upper - lower >= length else {
+                    point = (lower + upper - length) / 2
+                    normal = 0
+                    return false
+                }
+                let hitLow = point < lower
+                let hitHigh = point > upper - length
+                guard hitLow || hitHigh else { return false }
+                point = min(upper - length, max(lower, point))
+
+                // Don't bounce an object already moving away from the edge.
+                guard (hitLow && normal < 0) || (hitHigh && normal > 0) else { return false }
+                let impact = abs(normal)
+                let rebound = impact < 80 ? 0 : impact * restitution
+                normal = hitLow ? rebound : -rebound
+                return true
+            }
+
+            let hitX = confine(&position.x, &velocity.x, lower: limits.minX, upper: limits.maxX, length: size.width)
+            let hitY = confine(&position.y, &velocity.y, lower: limits.minY, upper: limits.maxY, length: size.height)
+            if hitX && !hitY { velocity.y *= surface.tangentialRetention }
+            if hitY && !hitX { velocity.x *= surface.tangentialRetention }
+            if hypot(velocity.x, velocity.y) < 2 { velocity = .zero }
+        }
+        return position
+    }
+
+    var isStopped: Bool { velocity == .zero }
 }

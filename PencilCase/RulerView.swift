@@ -7,6 +7,7 @@ final class RulerView: NSView {
     private let markings = RulerMarkingsView()
     private(set) var geometry = RulerGeometry()
     private var gesture: Gesture?
+    private var drawingAlongEdge = false
     private var motionTimer: Timer?
     private var motion: RulerMomentum?
     private var motionLimits = CGRect.zero
@@ -30,6 +31,8 @@ final class RulerView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        // The rotated instrument is laid out explicitly below.
+        autoresizesSubviews = false
         glass.style = .clear
         // This instrument is pale acrylic even when the surrounding app is dark.
         glass.appearance = NSAppearance(named: .aqua)
@@ -46,6 +49,33 @@ final class RulerView: NSView {
         // Only the actual instrument participates in AppKit hit testing.
         let local = markings.convert(point, from: superview)
         return markings.bounds.contains(local) ? markings : nil
+    }
+
+    var markingExclusionPath: CGPath? {
+        guard let window else { return nil }
+        func screen(_ p: CGPoint) -> CGPoint {
+            window.convertPoint(toScreen: glass.convert(p, to: nil))
+        }
+        let origin = screen(.zero)
+        let x = screen(CGPoint(x: 1, y: 0))
+        let y = screen(CGPoint(x: 0, y: 1))
+        var transform = CGAffineTransform(a: x.x - origin.x, b: x.y - origin.y,
+                                         c: y.x - origin.x, d: y.y - origin.y,
+                                         tx: origin.x, ty: origin.y)
+        let path = CGPath(roundedRect: glass.bounds, cornerWidth: RulerGeometry.cornerRadius,
+                          cornerHeight: RulerGeometry.cornerRadius, transform: nil)
+        return path.copy(using: &transform)
+    }
+
+    var markingGuides: [MarkerGuide] {
+        guard let window else { return [] }
+        func screen(_ point: CGPoint) -> CGPoint {
+            window.convertPoint(toScreen: glass.convert(point, to: nil))
+        }
+        return [CGFloat(0), RulerGeometry.height].map { y in
+            MarkerGuide(start: screen(CGPoint(x: RulerGeometry.inset, y: y)),
+                        end: screen(CGPoint(x: RulerGeometry.inset + geometry.length, y: y)))
+        }
     }
 
     func resetGeometry() {
@@ -73,6 +103,7 @@ final class RulerView: NSView {
         markings.geometry = geometry
         glass.frameCenterRotation = geometry.angle
         markings.needsDisplay = true
+        MarkerController.shared.rulerDidChange()
         window?.invalidateCursorRects(for: markings)
     }
 
@@ -83,6 +114,10 @@ final class RulerView: NSView {
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
 
+        // AppKit may resize the view tree during setFrame. At diagonal angles,
+        // resizing a still-rotated glass view can produce invalid view geometry.
+        // Remove the transform first, then restore it within this same transaction.
+        glass.frameCenterRotation = 0
         let size = geometry.enclosingSize
         window?.setFrame(NSRect(x: center.x - size.width / 2, y: center.y - size.height / 2,
                                 width: size.width, height: size.height), display: false, animate: false)
@@ -95,6 +130,22 @@ final class RulerView: NSView {
     }
 
     fileprivate func begin(_ event: NSEvent, location: CGPoint) {
+        let marker = MarkerController.shared
+        let inScale = location.x >= RulerGeometry.inset && location.x <= RulerGeometry.inset + geometry.length
+        let inDrawingBand = location.y >= 34 || location.y <= 8
+        if marker.isDrawing && inScale && inDrawingBand && !event.modifierFlags.contains(.option) {
+            stopMotion()
+            markings.clearMeasurementHover()
+            let edge = location.y >= 34 ? markingGuides.last : markingGuides.first
+            if let edge {
+                drawingAlongEdge = true
+                isInteracting = true
+                NSCursor.crosshair.push()
+                marker.beginStroke(at: edge.project(NSEvent.mouseLocation))
+                return
+            }
+        }
+        // Ruler gestures consume this drag without changing the selected drawing mode.
         stopMotion()
         isInteracting = true
         dragSamples.removeAll()
@@ -116,6 +167,11 @@ final class RulerView: NSView {
     }
 
     fileprivate func update(_ event: NSEvent) {
+        if drawingAlongEdge {
+            NSCursor.crosshair.set()
+            MarkerController.shared.continueStroke(at: NSEvent.mouseLocation)
+            return
+        }
         guard var gesture else { return }
         dragCursor?.set()
         let mouse = NSEvent.mouseLocation
@@ -126,6 +182,7 @@ final class RulerView: NSView {
                 window.setFrameOrigin(CGPoint(x: center.x - window.frame.width / 2,
                                               y: center.y - window.frame.height / 2))
             }
+            MarkerController.shared.rulerDidChange()
             dragSamples.append((mouse, event.timestamp))
             dragSamples.removeAll { event.timestamp - $0.time > 0.09 }
         } else if let end = gesture.resizeEnd {
@@ -161,6 +218,13 @@ final class RulerView: NSView {
     }
 
     fileprivate func end(allowMomentum: Bool = false) {
+        if drawingAlongEdge {
+            drawingAlongEdge = false
+            isInteracting = false
+            MarkerController.shared.finishStroke()
+            NSCursor.pop()
+            return
+        }
         let wasMoving = gesture?.moving == true
         isInteracting = false
         markings.isRotating = false
@@ -182,18 +246,9 @@ final class RulerView: NSView {
     }
 
     private func startMotion() {
-        guard momentumEnabled, let window, let first = dragSamples.first,
-              let last = dragSamples.last, last.time - first.time >= 0.015,
-              ProcessInfo.processInfo.systemUptime - last.time < 0.08 else { return }
-
-        let elapsed = last.time - first.time
-        var velocity = CGPoint(x: (last.point.x - first.point.x) / elapsed,
-                               y: (last.point.y - first.point.y) / elapsed)
-        let speed = hypot(velocity.x, velocity.y)
-        guard speed > 450 else { return }
-        let factor = min(1, 2200 / speed)
-        velocity.x *= factor
-        velocity.y *= factor
+        guard momentumEnabled, let window,
+              let velocity = RulerMomentum.releaseVelocity(samples: dragSamples,
+                  now: ProcessInfo.processInfo.systemUptime) else { return }
 
         // Keep the throw on the display containing most of the ruler at release.
         guard let screen = NSScreen.screens.max(by: {
@@ -203,7 +258,7 @@ final class RulerView: NSView {
         }) else { return }
         motionLimits = screen.visibleFrame
         motionOrigin = window.frame.origin
-        motion = RulerMomentum(velocity: velocity)
+        motion = RulerMomentum(velocity: velocity, surface: .ruler)
         isInteracting = true
         lastMotionTime = ProcessInfo.processInfo.systemUptime
         motionStarted = lastMotionTime
@@ -222,7 +277,7 @@ final class RulerView: NSView {
         }
         let now = ProcessInfo.processInfo.systemUptime
         let dt = now - lastMotionTime
-        guard dt < 0.1, now - motionStarted < 1.8 else {
+        guard dt < 0.1, now - motionStarted < 4 else {
             stopMotion()
             return
         }
@@ -232,6 +287,7 @@ final class RulerView: NSView {
         motionOrigin = motion.step(origin: motionOrigin, size: window.frame.size,
                                    limits: motionLimits, dt: dt)
         window.setFrameOrigin(motionOrigin)
+        MarkerController.shared.rulerDidChange()
         self.motion = motion
         if motion.isStopped { stopMotion() }
     }

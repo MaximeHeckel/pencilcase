@@ -10,6 +10,7 @@ final class RulerController: ObservableObject {
     @Published private(set) var shortcutError: String?
     private var panel: NSPanel?
     private var hotKey: EventHotKeyRef?
+    private var markerHotKey: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
 
     private init() {
@@ -17,8 +18,20 @@ final class RulerController: ObservableObject {
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
         )
-        let handlerStatus = InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            Task { @MainActor in RulerController.shared.toggle() }
+        let handlerStatus = InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            var identifier = EventHotKeyID()
+            guard let event,
+                  GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
+                                    MemoryLayout<EventHotKeyID>.size, nil, &identifier) == noErr,
+                  identifier.signature == 0x50434C52 else { return OSStatus(eventNotHandledErr) }
+            let id = identifier.id
+            Task { @MainActor in
+                if id == 1 { RulerController.shared.toggle() }
+                if id == 2 { MarkerController.shared.toggle() }
+                if id == 3 { MarkerController.shared.setDrawing(false) }
+                if id == 4 { MarkerController.shared.undoStroke() }
+                if id == 5 { MarkerController.shared.redoStroke() }
+            }
             return noErr
         }, 1, &eventType, nil, &eventHandler)
 
@@ -31,9 +44,28 @@ final class RulerController: ObservableObject {
             UInt32(kVK_ANSI_R), UInt32(cmdKey | shiftKey), identifier,
             GetApplicationEventTarget(), 0, &hotKey
         )
+        let markerStatus = RegisterEventHotKey(
+            UInt32(kVK_ANSI_M), UInt32(cmdKey | shiftKey), EventHotKeyID(signature: 0x50434C52, id: 2),
+            GetApplicationEventTarget(), 0, &markerHotKey
+        )
+        if markerStatus != noErr { shortcutError = "⇧⌘M unavailable outside this menu" }
         if status != noErr {
             shortcutError = "⇧⌘R unavailable outside this menu"
         }
+    }
+
+    var markingExclusionPath: CGPath? {
+        guard isVisible else { return nil }
+        return (panel?.contentView as? RulerView)?.markingExclusionPath
+    }
+
+    var markingGuides: [MarkerGuide] {
+        guard isVisible else { return [] }
+        return (panel?.contentView as? RulerView)?.markingGuides ?? []
+    }
+
+    func pauseForMarking() {
+        (panel?.contentView as? RulerView)?.cancelInteraction()
     }
 
     func toggle() { setVisible(!isVisible) }
@@ -52,6 +84,7 @@ final class RulerController: ObservableObject {
             panel?.orderOut(nil)
         }
         isVisible = visible
+        MarkerController.shared.rulerDidChange()
     }
 
     func resetPosition() {
@@ -64,6 +97,7 @@ final class RulerController: ObservableObject {
             x: frame.midX - panel.frame.width / 2,
             y: frame.midY - panel.frame.height / 2
         ))
+        MarkerController.shared.rulerDidChange()
     }
 
     func resetSizeAndAngle() {
@@ -83,7 +117,7 @@ final class RulerController: ObservableObject {
         window.backgroundColor = .clear
         // Native glass already defines its edge; avoid an additional dark window shadow.
         window.hasShadow = false
-        window.level = .floating
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 2)
         window.hidesOnDeactivate = false
         window.acceptsMouseMovedEvents = true
         window.isReleasedWhenClosed = false
