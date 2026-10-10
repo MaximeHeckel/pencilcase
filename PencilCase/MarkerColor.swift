@@ -18,39 +18,33 @@ struct MarkerColor: Identifiable {
 
 struct MarkerColorPalette: View {
     @ObservedObject var marker: MarkerController
+    let toolID: Int
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Marker").font(.headline)
+            Text(marker.tools[toolID].name).font(.headline)
             HStack(spacing: 8) {
                 ForEach(MarkerColor.presets) { preset in
-                    Button { marker.choosePaletteColor(preset.color) } label: {
+                    Button { marker.choosePaletteColor(preset.color, for: toolID) } label: {
                         Circle()
                             .fill(Color(nsColor: preset.color))
                             .frame(width: 24, height: 24)
                             .overlay(Circle().strokeBorder(.primary.opacity(0.12), lineWidth: 0.5))
                             .padding(4)
-                            .overlay(Circle().strokeBorder(marker.isSelected(preset.color) ? Color.primary : Color.clear, lineWidth: 1.5))
+                            .overlay(Circle().strokeBorder(marker.isSelected(preset.color, for: toolID) ? Color.primary : Color.clear, lineWidth: 1.5))
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(preset.name)
-                    .accessibilityValue(marker.isSelected(preset.color) ? "Selected" : "")
+                    .accessibilityValue(marker.isSelected(preset.color, for: toolID) ? "Selected" : "")
                     .help(preset.name)
                 }
             }
             Divider()
-            Button("Custom Color…") { marker.showCustomColor() }
+            Button("Custom Color…") { marker.showCustomColor(for: toolID) }
             Divider()
-            HStack {
-                Text("Stroke Width")
-                Spacer()
-                Text("\(Int(marker.strokeWidth)) pt")
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-            }
-            Slider(value: $marker.strokeWidth, in: 1...20, step: 1)
-                .accessibilityLabel("Stroke width")
-                .accessibilityValue("\(Int(marker.strokeWidth)) points")
+            Text("Click tip to draw · Drag barrel to move\n⌥ Drag to rotate · ⇧ to snap · Escape to finish")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .padding(14)
         .fixedSize()

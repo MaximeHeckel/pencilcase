@@ -7,8 +7,33 @@ import SwiftUI
 final class MarkerController: NSObject, ObservableObject {
     static let shared = MarkerController()
 
-    @Published private(set) var inkColor: NSColor = MarkerColor.presets[0].color
-    @Published var strokeWidth: Double = 3
+    @Published private(set) var tools = MarkerTool.defaults
+    @Published private(set) var selectedToolID = 0
+    private var customColorToolID = 0
+
+    var inkColor: NSColor { tools[selectedToolID].color }
+    var strokeWidth: Double { tools[selectedToolID].width }
+
+    func selectTool(_ id: Int) {
+        guard tools.indices.contains(id), id != selectedToolID else { return }
+        finishStroke()
+        selectedToolID = id
+        redrawTools()
+    }
+
+    func activateTip(_ id: Int) {
+        let wasActive = selectedToolID == id && isDrawing
+        selectTool(id)
+        setDrawing(!wasActive)
+    }
+
+    private func redrawTools() {
+        for (id, panel) in markerPanels.enumerated() {
+            panel.contentView?.needsDisplay = true
+            panel.contentView?.setAccessibilityLabel("\(tools[id].name) \(id + 1)")
+        }
+    }
+
     private var colorPopover: NSPopover?
     private var escapeHotKey: EventHotKeyRef?
     private var undoHotKey: EventHotKeyRef?
@@ -22,7 +47,11 @@ final class MarkerController: NSObject, ObservableObject {
     @Published private(set) var isDrawing = false
     @Published private(set) var hasMarkings = false
 
-    private var markerPanel: NSPanel?
+    private var markerPanels: [NSPanel] = []
+    private var markerPanel: NSPanel? {
+        markerPanels.indices.contains(selectedToolID) ? markerPanels[selectedToolID] : nil
+    }
+
     private var canvases: [MarkerCanvasPanel] = []
     private var strokes: [Stroke] = []
     private var undoneStrokes: [Stroke] = []
@@ -36,6 +65,7 @@ final class MarkerController: NSObject, ObservableObject {
         var points: [CGPoint]
         var color: NSColor
         var width: CGFloat
+        var opacity: CGFloat
         var excludedRuler: CGPath?
         var finished: TimeInterval?
     }
@@ -50,7 +80,7 @@ final class MarkerController: NSObject, ObservableObject {
                 if self.markerPanel?.isOnActiveSpace != true {
                     self.setDrawing(false)
                     self.colorPopover?.close()
-                    (self.markerPanel?.contentView as? MarkerView)?.cancelInteraction()
+                    self.markerPanels.forEach { ($0.contentView as? MarkerView)?.cancelInteraction() }
                 }
             }
         }
@@ -66,35 +96,37 @@ final class MarkerController: NSObject, ObservableObject {
         }
     }
 
-    func selectColor(_ color: NSColor) {
+    func selectColor(_ color: NSColor, for toolID: Int? = nil) {
         // Resolve once so a stroke does not change with appearance or later selection.
-        inkColor = (color.usingColorSpace(.sRGB) ?? color).withAlphaComponent(1)
-        markerPanel?.contentView?.needsDisplay = true
+        tools[toolID ?? selectedToolID].color = (color.usingColorSpace(.sRGB) ?? color).withAlphaComponent(1)
+        redrawTools()
     }
 
-    func isSelected(_ color: NSColor) -> Bool {
-        guard let a = inkColor.usingColorSpace(.sRGB), let b = color.usingColorSpace(.sRGB) else { return false }
+    func isSelected(_ color: NSColor, for toolID: Int? = nil) -> Bool {
+        guard let a = tools[toolID ?? selectedToolID].color.usingColorSpace(.sRGB), let b = color.usingColorSpace(.sRGB) else { return false }
         return abs(a.redComponent - b.redComponent) < 0.001
             && abs(a.greenComponent - b.greenComponent) < 0.001
             && abs(a.blueComponent - b.blueComponent) < 0.001
     }
 
-    func showColorPalette(from view: NSView) {
-        (markerPanel?.contentView as? MarkerView)?.stopMotion()
+    func showColorPalette(from view: MarkerView) {
+        let toolID = view.toolID
+        view.stopMotion()
         colorPopover?.close()
         let popover = NSPopover()
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: MarkerColorPalette(marker: self))
+        popover.contentViewController = NSHostingController(rootView: MarkerColorPalette(marker: self, toolID: toolID))
         colorPopover = popover
         popover.show(relativeTo: view.bounds, of: view, preferredEdge: .maxX)
     }
 
-    func choosePaletteColor(_ color: NSColor) {
-        selectColor(color)
+    func choosePaletteColor(_ color: NSColor, for toolID: Int) {
+        selectColor(color, for: toolID)
         colorPopover?.close()
     }
 
-    func showCustomColor() {
+    func showCustomColor(for toolID: Int? = nil) {
+        customColorToolID = toolID ?? selectedToolID
         colorPopover?.close()
         // Release the desktop input surface while interacting with the native picker.
         setDrawing(false)
@@ -103,28 +135,30 @@ final class MarkerController: NSObject, ObservableObject {
         panel.setAction(#selector(customColorChanged(_:)))
         panel.isContinuous = true
         panel.showsAlpha = false
-        panel.color = inkColor
+        panel.color = tools[customColorToolID].color
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 4)
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
     }
 
     @objc private func customColorChanged(_ sender: NSColorPanel) {
-        selectColor(sender.color)
+        selectColor(sender.color, for: customColorToolID)
     }
 
     func toggle() { setVisible(!isVisible) }
 
     func setVisible(_ visible: Bool) {
         if visible {
-            if markerPanel == nil { makeMarker() }
+            if markerPanels.isEmpty { makeMarkers() }
             ensureMarkerOnScreen()
-            markerPanel?.orderFrontRegardless()
+            markerPanels.forEach { $0.orderFrontRegardless() }
         } else {
             colorPopover?.close()
             setDrawing(false)
-            (markerPanel?.contentView as? MarkerView)?.cancelInteraction()
-            markerPanel?.orderOut(nil)
+            markerPanels.forEach {
+                ($0.contentView as? MarkerView)?.cancelInteraction()
+                $0.orderOut(nil)
+            }
         }
         isVisible = visible
     }
@@ -184,7 +218,7 @@ final class MarkerController: NSObject, ObservableObject {
             canvases.forEach { $0.resignKey() }
             NSCursor.arrow.set()
         }
-        markerPanel?.contentView?.needsDisplay = true
+        redrawTools()
     }
 
     func undoStroke() {
@@ -222,7 +256,7 @@ final class MarkerController: NSObject, ObservableObject {
         guide = RulerController.shared.markingGuides.min { $0.distance(to: point) < $1.distance(to: point) }
         if let candidate = guide, candidate.distance(to: point) > 12 { guide = nil }
         current = Stroke(points: [guide?.strokePoint(point, width: CGFloat(strokeWidth)) ?? point], color: inkColor, width: CGFloat(strokeWidth),
-                         excludedRuler: RulerController.shared.markingExclusionPath)
+                         opacity: tools[selectedToolID].opacity, excludedRuler: RulerController.shared.markingExclusionPath)
         refresh()
     }
 
@@ -309,7 +343,7 @@ final class MarkerController: NSObject, ObservableObject {
             }
 
             let age = stroke.finished.map { now - $0 } ?? 0
-            let alpha = max(0, min(1, (30.5 - age) / 0.5))
+            let alpha = stroke.opacity * max(0, min(1, (30.5 - age) / 0.5))
             context.setStrokeColor(stroke.color.withAlphaComponent(alpha).cgColor)
             context.setFillColor(stroke.color.withAlphaComponent(alpha).cgColor)
             context.setLineWidth(stroke.width)
@@ -351,29 +385,35 @@ final class MarkerController: NSObject, ObservableObject {
         }
     }
 
-    private func makeMarker() {
-        let panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 66, height: 210), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        panel.title = "Pencil Case Marker"
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = false
-        panel.hidesOnDeactivate = false
-        panel.isReleasedWhenClosed = false
-        panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 3)
-        panel.collectionBehavior = [.canJoinAllApplications]
-        panel.contentView = MarkerView(frame: CGRect(origin: .zero, size: panel.frame.size))
-        markerPanel = panel
-        if let frame = NSScreen.main?.visibleFrame {
-            panel.setFrameOrigin(CGPoint(x: frame.midX + 260, y: frame.midY - 100))
+    private func makeMarkers() {
+        let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+        let frame = screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1000, height: 700)
+        let frames = MarkerGeometry.spawnFrames(in: frame)
+        markerPanels = tools.indices.map { id in
+            let panel = NSPanel(contentRect: frames[id], styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.title = "Pencil Case Drawing Tool \(id + 1)"
+            panel.isOpaque = false
+            panel.backgroundColor = .clear
+            panel.hasShadow = false
+            panel.hidesOnDeactivate = false
+            panel.isReleasedWhenClosed = false
+            panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 3)
+            panel.collectionBehavior = [.canJoinAllApplications]
+            panel.contentView = MarkerView(frame: CGRect(origin: .zero, size: frames[id].size), toolID: id)
+            return panel
         }
     }
 
     private func ensureMarkerOnScreen() {
-        guard let panel = markerPanel,
-              !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(panel.frame) }),
-              let frame = NSScreen.main?.visibleFrame else { return }
-        panel.setFrameOrigin(CGPoint(x: frame.midX, y: frame.midY))
+        guard let screen = NSScreen.main else { return }
+        let frames = MarkerGeometry.spawnFrames(in: screen.visibleFrame)
+        for (id, panel) in markerPanels.enumerated() {
+            if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(panel.frame) }) {
+                panel.setFrameOrigin(frames[id].origin)
+            }
+        }
     }
+
 }
 
 private final class MarkerCanvasPanel: NSPanel {

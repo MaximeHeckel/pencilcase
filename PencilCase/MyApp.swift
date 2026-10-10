@@ -8,8 +8,6 @@ struct PencilCaseApp: App {
     @StateObject private var loupe = LoupeController.shared
     @StateObject private var marker = MarkerController.shared
 
-    private let strokeWidths: [Double] = [1, 2, 3, 4, 6, 8, 12, 16, 20]
-
     var body: some Scene {
         MenuBarExtra("Pencil Case", systemImage: "pencil.and.ruler") {
             Toggle("Ruler", isOn: Binding(
@@ -18,7 +16,7 @@ struct PencilCaseApp: App {
             ))
             .keyboardShortcut("r", modifiers: [.command, .shift])
 
-            Toggle("Marker", isOn: Binding(
+            Toggle("Markers", isOn: Binding(
                 get: { marker.isVisible }, set: { marker.setVisible($0) }
             ))
             .keyboardShortcut("m", modifiers: [.command, .shift])
@@ -45,26 +43,24 @@ struct PencilCaseApp: App {
             Divider()
 
             Menu("Tool Options") {
-                Menu("Marker") {
-                    Menu("Color") {
-                        ForEach(MarkerColor.presets) { preset in
-                            Button { marker.selectColor(preset.color) } label: {
-                                Label(preset.name, systemImage: marker.isSelected(preset.color) ? "checkmark.circle.fill" : "circle.fill")
+                Menu("Markers") {
+                    ForEach(marker.tools) { tool in
+                        Menu("\(tool.id + 1). \(tool.name)") {
+                            Button("Use for Drawing") {
+                                marker.selectTool(tool.id)
+                                marker.setDrawing(true)
                             }
-                        }
-                        Divider()
-                        Button("Custom Color…") { marker.showCustomColor() }
-                    }
+                            Menu("Color") {
+                                ForEach(MarkerColor.presets) { preset in
+                                    Button { marker.selectColor(preset.color, for: tool.id) } label: {
+                                        Label(preset.name, systemImage: marker.isSelected(preset.color, for: tool.id) ? "checkmark.circle.fill" : "circle.fill")
+                                    }
+                                }
+                                Divider()
+                                Button("Custom Color…") { marker.showCustomColor(for: tool.id) }
+                            }
 
-                    Menu("Stroke Thickness (\(Int(marker.strokeWidth)) pt)") {
-                        Picker("Stroke Thickness", selection: $marker.strokeWidth) {
-                            // Include slider values between the menu presets so the
-                            // current thickness always has an accurate checkmark.
-                            ForEach(Array(Set(strokeWidths + [marker.strokeWidth])).sorted(), id: \.self) { width in
-                                Text("\(Int(width)) pt").tag(width)
-                            }
                         }
-                        .pickerStyle(.inline)
                     }
                 }
 
@@ -81,13 +77,6 @@ struct PencilCaseApp: App {
                     Text("Drag the ruler to move or throw it")
                     Text("Drag ends to resize")
                     Text("⌥ Drag to rotate · ⇧ to snap")
-                }
-                Menu("Marker Controls") {
-                    Text("Click the tip to toggle drawing")
-                    Text("Drag the barrel to move or throw it")
-                    Text("Escape to finish drawing")
-                    Text("Draw along a ruler edge for straight lines")
-                    Text("Ink fades after 30 seconds")
                 }
                 Menu("Loupe Controls") {
                     Text("Drag the lens to move or throw it")

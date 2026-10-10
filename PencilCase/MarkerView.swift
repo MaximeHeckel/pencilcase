@@ -2,6 +2,14 @@ import AppKit
 
 /// A small physical instrument. Only its tip switches modes; the barrel moves it.
 final class MarkerView: NSView {
+    let toolID: Int
+    private var angle: CGFloat
+    private var rotating = false
+    private var initialAngle: CGFloat = 0
+    private var lastPointerAngle: CGFloat = 0
+    private var rotationDelta: CGFloat = 0
+    private var rotationCenter = CGPoint.zero
+    private var snap = RulerAngleSnap()
     private var startMouse: CGPoint?
     private var startOrigin = CGPoint.zero
     private var samples: [(point: CGPoint, time: TimeInterval)] = []
@@ -13,24 +21,43 @@ final class MarkerView: NSView {
     private var started: TimeInterval = 0
     private var tipPressed = false
 
-    override init(frame frameRect: NSRect) {
+    init(frame frameRect: NSRect, toolID: Int) {
+        self.toolID = toolID
+        angle = MarkerGeometry.spawnAngles[toolID]
         super.init(frame: frameRect)
         setAccessibilityElement(true)
-        setAccessibilityLabel("Marker")
-        setAccessibilityHelp("Click the tip to draw. Right-click for colors. Escape exits drawing. Drag the barrel to move or throw.")
+        setAccessibilityLabel("Drawing tool \(toolID + 1)")
+        setAccessibilityHelp("Click the tip to draw. Right-click for colors. Escape exits drawing. Drag the barrel to move or throw. Option-drag to rotate; Shift to snap.")
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    private func toolPoint(_ event: NSEvent) -> CGPoint {
+        MarkerGeometry.localPoint(convert(event.locationInWindow, from: nil), size: bounds.size, angle: angle)
+    }
+
     override func resetCursorRects() {
-        addCursorRect(CGRect(x: 14, y: 8, width: 38, height: 145), cursor: .openHand)
-        addCursorRect(CGRect(x: 14, y: 153, width: 38, height: 49), cursor: .pointingHand)
+        addCursorRect(bounds, cursor: .openHand)
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let active = MarkerController.shared.isDrawing
-        let color = MarkerController.shared.inkColor
-        let barrel = NSBezierPath(roundedRect: CGRect(x: 17, y: 12, width: 32, height: 146), xRadius: 9, yRadius: 9)
+        let controller = MarkerController.shared
+        let tool = controller.tools[toolID]
+        let active = controller.isDrawing && controller.selectedToolID == toolID
+        let color = tool.color
+        let broad = tool.width >= 10
+        let thin = tool.width <= 3
+        let bodyWidth: CGFloat = thin ? 20 : broad ? 42 : 32
+        let left = 33 - bodyWidth / 2
+
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        let transform = NSAffineTransform()
+        transform.translateX(by: bounds.midX, yBy: bounds.midY)
+        transform.rotate(byDegrees: angle)
+        transform.translateX(by: -33, yBy: -105)
+        transform.concat()
+        let barrel = NSBezierPath(roundedRect: CGRect(x: left, y: 12, width: bodyWidth, height: 146), xRadius: 9, yRadius: 9)
         NSGraphicsContext.saveGraphicsState()
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.22)
@@ -47,16 +74,23 @@ final class MarkerView: NSView {
         barrel.stroke()
 
         let nib = NSBezierPath()
-        nib.move(to: CGPoint(x: 20, y: 156))
-        nib.line(to: CGPoint(x: 29, y: 192))
-        nib.curve(to: CGPoint(x: 37, y: 192), controlPoint1: CGPoint(x: 30, y: 198), controlPoint2: CGPoint(x: 36, y: 198))
-        nib.line(to: CGPoint(x: 46, y: 156))
+        if broad {
+            nib.move(to: CGPoint(x: left + 4, y: 156))
+            nib.line(to: CGPoint(x: left + 7, y: 185))
+            nib.line(to: CGPoint(x: left + bodyWidth - 7, y: 194))
+            nib.line(to: CGPoint(x: left + bodyWidth - 4, y: 156))
+        } else {
+            nib.move(to: CGPoint(x: left + 3, y: 156))
+            nib.line(to: CGPoint(x: thin ? 32 : 29, y: 192))
+            nib.line(to: CGPoint(x: thin ? 34 : 37, y: 192))
+            nib.line(to: CGPoint(x: left + bodyWidth - 3, y: 156))
+        }
         nib.close()
         NSGradient(colors: [color, color.blended(withFraction: 0.32, of: .white) ?? color, color])?.draw(in: nib, angle: 0)
 
         color.setFill()
-        NSBezierPath(roundedRect: CGRect(x: 17, y: 151, width: 32, height: 9), xRadius: 2, yRadius: 2).fill()
-        NSBezierPath(rect: CGRect(x: 17, y: 119, width: 32, height: 7)).fill()
+        NSBezierPath(roundedRect: CGRect(x: left, y: 151, width: bodyWidth, height: 9), xRadius: 2, yRadius: 2).fill()
+        NSBezierPath(rect: CGRect(x: left, y: 119, width: bodyWidth, height: 7)).fill()
 
         let grip = NSBezierPath()
         for y in stride(from: 42, through: 90, by: 4) {
@@ -87,10 +121,16 @@ final class MarkerView: NSView {
             return
         }
         stopMotion()
-        tipPressed = convert(event.locationInWindow, from: nil).y >= 151
+        rotating = event.modifierFlags.contains(.option)
+        tipPressed = !rotating && toolPoint(event).y >= 151
         if tipPressed { return }
         startMouse = NSEvent.mouseLocation
         startOrigin = window?.frame.origin ?? .zero
+        rotationCenter = CGPoint(x: startOrigin.x + bounds.midX, y: startOrigin.y + bounds.midY)
+        initialAngle = angle
+        rotationDelta = 0
+        snap = RulerAngleSnap()
+        lastPointerAngle = atan2(NSEvent.mouseLocation.y - rotationCenter.y, NSEvent.mouseLocation.x - rotationCenter.x)
         samples = [(NSEvent.mouseLocation, event.timestamp)]
         NSCursor.closedHand.push()
     }
@@ -98,6 +138,25 @@ final class MarkerView: NSView {
     override func mouseDragged(with event: NSEvent) {
         guard let startMouse else { return }
         let point = NSEvent.mouseLocation
+        if rotating {
+            let dx = point.x - rotationCenter.x
+            let dy = point.y - rotationCenter.y
+            guard hypot(dx, dy) >= 12 else { return }
+            let pointer = atan2(dy, dx)
+            let delta = pointer - lastPointerAngle
+            rotationDelta += atan2(sin(delta), cos(delta)) * 180 / .pi
+            lastPointerAngle = pointer
+            let previousTarget = snap.target
+            angle = RulerGeometry.signedAngle(snap.resolve(initialAngle + rotationDelta, force: event.modifierFlags.contains(.shift)))
+            if let target = snap.target, target != previousTarget {
+                NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .drawCompleted)
+            }
+            let size = MarkerGeometry.size(angle: angle)
+            window?.setFrame(CGRect(x: rotationCenter.x - size.width / 2, y: rotationCenter.y - size.height / 2,
+                                   width: size.width, height: size.height), display: false)
+            needsDisplay = true
+            return
+        }
         window?.setFrameOrigin(CGPoint(x: startOrigin.x + point.x - startMouse.x, y: startOrigin.y + point.y - startMouse.y))
         samples.append((point, event.timestamp))
         samples.removeAll { event.timestamp - $0.time > 0.09 }
@@ -106,15 +165,16 @@ final class MarkerView: NSView {
     override func mouseUp(with event: NSEvent) {
         if tipPressed {
             tipPressed = false
-            if convert(event.locationInWindow, from: nil).y >= 151 {
-                MarkerController.shared.setDrawing(!MarkerController.shared.isDrawing)
+            if toolPoint(event).y >= 151 {
+                MarkerController.shared.activateTip(toolID)
             }
             return
         }
         guard startMouse != nil else { return }
         startMouse = nil
         NSCursor.pop()
-        startThrow()
+        if !rotating { startThrow() }
+        rotating = false
         samples.removeAll()
     }
 
@@ -123,11 +183,12 @@ final class MarkerView: NSView {
         if startMouse != nil { NSCursor.pop() }
         startMouse = nil
         tipPressed = false
+        rotating = false
         samples.removeAll()
     }
 
     override func accessibilityPerformPress() -> Bool {
-        MarkerController.shared.setDrawing(!MarkerController.shared.isDrawing)
+        MarkerController.shared.activateTip(toolID)
         return true
     }
 
