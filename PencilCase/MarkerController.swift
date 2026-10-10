@@ -30,6 +30,7 @@ final class MarkerController: NSObject, ObservableObject {
     private var guide: MarkerGuide?
     private var expiryTimer: Timer?
     private var screenObserver: NSObjectProtocol?
+    private var spaceObserver: NSObjectProtocol?
 
     private struct Stroke {
         var points: [CGPoint]
@@ -41,6 +42,18 @@ final class MarkerController: NSObject, ObservableObject {
 
     private override init() {
         super.init()
+        spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.markerPanel?.isOnActiveSpace != true {
+                    self.setDrawing(false)
+                    self.colorPopover?.close()
+                    (self.markerPanel?.contentView as? MarkerView)?.cancelInteraction()
+                }
+            }
+        }
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -120,6 +133,7 @@ final class MarkerController: NSObject, ObservableObject {
         guard enabled != isDrawing else { return }
         if enabled {
             setVisible(true)
+            guard markerPanel?.isOnActiveSpace == true else { return }
             (markerPanel?.contentView as? MarkerView)?.stopMotion()
             RulerController.shared.pauseForMarking()
             if canvases.isEmpty { rebuildCanvases() }
@@ -325,11 +339,12 @@ final class MarkerController: NSObject, ObservableObject {
             panel.isOpaque = false
             panel.backgroundColor = .clear
             panel.hasShadow = false
-            panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+            // Instruments remain directly interactive while drawing mode is active.
+            panel.level = .floating
             panel.hidesOnDeactivate = false
             panel.isReleasedWhenClosed = false
             panel.ignoresMouseEvents = true
-            panel.collectionBehavior = [.canJoinAllSpaces, .canJoinAllApplications]
+            panel.collectionBehavior = [.canJoinAllApplications]
             panel.contentView = MarkerCanvasView(frame: CGRect(origin: .zero, size: screen.frame.size))
             if hasMarkings { panel.orderFrontRegardless() }
             return panel
@@ -345,7 +360,7 @@ final class MarkerController: NSObject, ObservableObject {
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 3)
-        panel.collectionBehavior = [.canJoinAllSpaces, .canJoinAllApplications]
+        panel.collectionBehavior = [.canJoinAllApplications]
         panel.contentView = MarkerView(frame: CGRect(origin: .zero, size: panel.frame.size))
         markerPanel = panel
         if let frame = NSScreen.main?.visibleFrame {

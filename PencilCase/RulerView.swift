@@ -38,10 +38,7 @@ final class RulerView: NSView {
         super.init(frame: frameRect)
         // The rotated instrument is laid out explicitly below.
         autoresizesSubviews = false
-        glass.style = .clear
-        // This instrument is pale acrylic even when the surrounding app is dark.
-        glass.appearance = NSAppearance(named: .aqua)
-        glass.cornerRadius = RulerGeometry.cornerRadius
+        InstrumentGlass.configure(glass, cornerRadius: RulerGeometry.cornerRadius)
         glass.contentView = markings
         markings.owner = self
         setAccessibilityElement(true)
@@ -703,7 +700,7 @@ private final class RulerMarkingsView: NSView {
 
     private func drawStaticArtwork() {
         // A luminous white body supports charcoal ink over varied desktop content.
-        NSColor.white.withAlphaComponent(0.24).setFill()
+        NSColor.white.withAlphaComponent(InstrumentGlass.acrylicOverlayOpacity).setFill()
         NSBezierPath(roundedRect: bounds, xRadius: RulerGeometry.cornerRadius,
                      yRadius: RulerGeometry.cornerRadius).fill()
 

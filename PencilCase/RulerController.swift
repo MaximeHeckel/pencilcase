@@ -9,11 +9,23 @@ final class RulerController: ObservableObject {
     @Published private(set) var isVisible = false
     @Published private(set) var shortcutError: String?
     private var panel: NSPanel?
+    private var spaceObserver: NSObjectProtocol?
     private var hotKey: EventHotKeyRef?
+    private var loupeHotKey: EventHotKeyRef?
     private var markerHotKey: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
 
     private init() {
+        spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.panel?.isOnActiveSpace != true { self.pauseForMarking() }
+                MarkerController.shared.rulerDidChange()
+            }
+        }
+
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
@@ -31,6 +43,7 @@ final class RulerController: ObservableObject {
                 if id == 3 { MarkerController.shared.setDrawing(false) }
                 if id == 4 { MarkerController.shared.undoStroke() }
                 if id == 5 { MarkerController.shared.redoStroke() }
+                if id == 6 { LoupeController.shared.toggle() }
             }
             return noErr
         }, 1, &eventType, nil, &eventHandler)
@@ -48,6 +61,9 @@ final class RulerController: ObservableObject {
             UInt32(kVK_ANSI_M), UInt32(cmdKey | shiftKey), EventHotKeyID(signature: 0x50434C52, id: 2),
             GetApplicationEventTarget(), 0, &markerHotKey
         )
+        let loupeStatus = RegisterEventHotKey(UInt32(kVK_ANSI_L), UInt32(cmdKey | shiftKey),
+            EventHotKeyID(signature: 0x50434C52, id: 6), GetApplicationEventTarget(), 0, &loupeHotKey)
+        if loupeStatus != noErr { shortcutError = "⇧⌘L unavailable outside this menu" }
         if markerStatus != noErr { shortcutError = "⇧⌘M unavailable outside this menu" }
         if status != noErr {
             shortcutError = "⇧⌘R unavailable outside this menu"
@@ -55,12 +71,12 @@ final class RulerController: ObservableObject {
     }
 
     var markingExclusionPath: CGPath? {
-        guard isVisible else { return nil }
+        guard isVisible, panel?.isOnActiveSpace == true else { return nil }
         return (panel?.contentView as? RulerView)?.markingExclusionPath
     }
 
     var markingGuides: [MarkerGuide] {
-        guard isVisible else { return [] }
+        guard isVisible, panel?.isOnActiveSpace == true else { return [] }
         return (panel?.contentView as? RulerView)?.markingGuides ?? []
     }
 
@@ -85,6 +101,7 @@ final class RulerController: ObservableObject {
         }
         isVisible = visible
         MarkerController.shared.rulerDidChange()
+
     }
 
     func resetPosition() {
@@ -121,7 +138,7 @@ final class RulerController: ObservableObject {
         window.hidesOnDeactivate = false
         window.acceptsMouseMovedEvents = true
         window.isReleasedWhenClosed = false
-        window.collectionBehavior = [.canJoinAllSpaces, .canJoinAllApplications]
+        window.collectionBehavior = [.canJoinAllApplications]
         window.contentView = RulerView(frame: initialFrame)
         panel = window
         resetPosition()
