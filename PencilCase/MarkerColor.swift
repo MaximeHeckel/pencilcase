@@ -6,6 +6,35 @@ struct MarkerColor: Identifiable {
     let color: NSColor
     var id: String { name }
 
+    /// A non-template image keeps its actual ink color in native macOS menus.
+    func menuSwatch(selected: Bool) -> NSImage {
+        let ink = color.usingColorSpace(.sRGB) ?? color
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
+            let circle = NSBezierPath(ovalIn: rect.insetBy(dx: 1.5, dy: 1.5))
+            ink.setFill()
+            circle.fill()
+            NSColor.gray.withAlphaComponent(0.65).setStroke()
+            circle.lineWidth = 0.6
+            circle.stroke()
+
+            if selected {
+                let luminance = 0.2126 * ink.redComponent + 0.7152 * ink.greenComponent + 0.0722 * ink.blueComponent
+                (luminance > 0.6 ? NSColor.black : NSColor.white).setStroke()
+                let check = NSBezierPath()
+                check.move(to: CGPoint(x: 5, y: 9))
+                check.line(to: CGPoint(x: 8, y: 6))
+                check.line(to: CGPoint(x: 13, y: 12))
+                check.lineWidth = 1.7
+                check.lineCapStyle = .round
+                check.lineJoinStyle = .round
+                check.stroke()
+            }
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
+
     static let presets: [MarkerColor] = [
         MarkerColor(name: "Red", color: NSColor(srgbRed: 0.95, green: 0.23, blue: 0.25, alpha: 1)),
         MarkerColor(name: "Blue", color: NSColor(srgbRed: 0, green: 122.0 / 255, blue: 1, alpha: 1)),

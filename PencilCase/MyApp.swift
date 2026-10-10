@@ -2,9 +2,8 @@ import SwiftUI
 
 @main
 struct PencilCaseApp: App {
-    @AppStorage("rulerMomentumEnabled") private var momentumEnabled = true
+    @StateObject private var shortcuts = ToolShortcuts.shared
     @StateObject private var ruler = RulerController.shared
-    @AppStorage("loupeTickSound") private var loupeTickSound = true
     @StateObject private var loupe = LoupeController.shared
     @StateObject private var marker = MarkerController.shared
 
@@ -14,23 +13,20 @@ struct PencilCaseApp: App {
                 get: { ruler.isVisible },
                 set: { ruler.setVisible($0) }
             ))
-            .keyboardShortcut("r", modifiers: [.command, .shift])
+            .keyboardShortcut(shortcuts.shortcut(for: .ruler)?.menuShortcut)
 
             Toggle("Markers", isOn: Binding(
                 get: { marker.isVisible }, set: { marker.setVisible($0) }
             ))
-            .keyboardShortcut("m", modifiers: [.command, .shift])
+            .keyboardShortcut(shortcuts.shortcut(for: .markers)?.menuShortcut)
 
             Toggle("Loupe", isOn: Binding(
                 get: { loupe.isVisible }, set: { loupe.setVisible($0) }
             ))
-            .keyboardShortcut("l", modifiers: [.command, .shift])
+            .keyboardShortcut(shortcuts.shortcut(for: .loupe)?.menuShortcut)
 
             Divider()
 
-            Toggle("Draw on Screen", isOn: Binding(
-                get: { marker.isDrawing }, set: { marker.setDrawing($0) }
-            ))
             Button("Undo Stroke") { marker.undoStroke() }
                 .keyboardShortcut("z", modifiers: [.command])
                 .disabled(!marker.canUndo)
@@ -38,6 +34,7 @@ struct PencilCaseApp: App {
                 .keyboardShortcut("z", modifiers: [.command, .shift])
                 .disabled(!marker.canRedo)
             Button("Clear All Markings") { marker.clearMarkings() }
+                .keyboardShortcut(shortcuts.shortcut(for: .clearMarkings)?.menuShortcut)
                 .disabled(!marker.hasMarkings)
 
             Divider()
@@ -53,7 +50,12 @@ struct PencilCaseApp: App {
                             Menu("Color") {
                                 ForEach(MarkerColor.presets) { preset in
                                     Button { marker.selectColor(preset.color, for: tool.id) } label: {
-                                        Label(preset.name, systemImage: marker.isSelected(preset.color, for: tool.id) ? "checkmark.circle.fill" : "circle.fill")
+                                        Label {
+                                            Text(preset.name)
+                                        } icon: {
+                                            Image(nsImage: preset.menuSwatch(selected: marker.isSelected(preset.color, for: tool.id)))
+                                                .renderingMode(.original)
+                                        }
                                     }
                                 }
                                 Divider()
@@ -66,23 +68,8 @@ struct PencilCaseApp: App {
 
                 Button("Reset Ruler Size and Angle") { ruler.resetSizeAndAngle() }
 
-                Divider()
-
-                Toggle("Throwing Momentum", isOn: $momentumEnabled)
-                Toggle("Loupe Dial Sound", isOn: $loupeTickSound)
             }
 
-            Menu("Help") {
-                Menu("Ruler Controls") {
-                    Text("Drag the ruler to move or throw it")
-                    Text("Drag ends to resize")
-                    Text("⌥ Drag to rotate · ⇧ to snap")
-                }
-                Menu("Loupe Controls") {
-                    Text("Drag the lens to move or throw it")
-                    Text("Rotate the ring to adjust zoom")
-                }
-            }
 
             if let error = loupe.error {
                 Divider()
@@ -92,14 +79,16 @@ struct PencilCaseApp: App {
                     NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
                 }
             }
+            if let error = shortcuts.error { Text(error) }
             if let error = ruler.shortcutError { Text(error) }
             if let error = marker.escapeShortcutError { Text(error) }
             if let error = marker.historyShortcutError { Text(error) }
 
             Divider()
 
+            Button("Settings…") { SettingsWindow.shared.show() }
+
             Button("Quit Pencil Case") { NSApplication.shared.terminate(nil) }
-                .keyboardShortcut("q")
         }
         .menuBarExtraStyle(.menu)
     }

@@ -10,9 +10,6 @@ final class RulerController: ObservableObject {
     @Published private(set) var shortcutError: String?
     private var panel: NSPanel?
     private var spaceObserver: NSObjectProtocol?
-    private var hotKey: EventHotKeyRef?
-    private var loupeHotKey: EventHotKeyRef?
-    private var markerHotKey: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
 
     private init() {
@@ -38,12 +35,14 @@ final class RulerController: ObservableObject {
                   identifier.signature == 0x50434C52 else { return OSStatus(eventNotHandledErr) }
             let id = identifier.id
             Task { @MainActor in
+                guard ToolShortcuts.shared.recording == nil else { return }
                 if id == 1 { RulerController.shared.toggle() }
                 if id == 2 { MarkerController.shared.toggle() }
                 if id == 3 { MarkerController.shared.setDrawing(false) }
                 if id == 4 { MarkerController.shared.undoStroke() }
                 if id == 5 { MarkerController.shared.redoStroke() }
                 if id == 6 { LoupeController.shared.toggle() }
+                if id == 7 { MarkerController.shared.clearMarkings() }
             }
             return noErr
         }, 1, &eventType, nil, &eventHandler)
@@ -52,22 +51,7 @@ final class RulerController: ObservableObject {
             shortcutError = "Global shortcut unavailable"
             return
         }
-        let identifier = EventHotKeyID(signature: 0x50434C52, id: 1)
-        let status = RegisterEventHotKey(
-            UInt32(kVK_ANSI_R), UInt32(cmdKey | shiftKey), identifier,
-            GetApplicationEventTarget(), 0, &hotKey
-        )
-        let markerStatus = RegisterEventHotKey(
-            UInt32(kVK_ANSI_M), UInt32(cmdKey | shiftKey), EventHotKeyID(signature: 0x50434C52, id: 2),
-            GetApplicationEventTarget(), 0, &markerHotKey
-        )
-        let loupeStatus = RegisterEventHotKey(UInt32(kVK_ANSI_L), UInt32(cmdKey | shiftKey),
-            EventHotKeyID(signature: 0x50434C52, id: 6), GetApplicationEventTarget(), 0, &loupeHotKey)
-        if loupeStatus != noErr { shortcutError = "⇧⌘L unavailable outside this menu" }
-        if markerStatus != noErr { shortcutError = "⇧⌘M unavailable outside this menu" }
-        if status != noErr {
-            shortcutError = "⇧⌘R unavailable outside this menu"
-        }
+        ToolShortcuts.shared.start()
     }
 
     var markingExclusionPath: CGPath? {
@@ -132,7 +116,7 @@ final class RulerController: ObservableObject {
         window.title = "Pencil Case Ruler"
         window.isOpaque = false
         window.backgroundColor = .clear
-        // Native glass already defines its edge; avoid an additional dark window shadow.
+        // A separate diffuse shadow avoids the native window shadow’s dark rim.
         window.hasShadow = false
         window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 2)
         window.hidesOnDeactivate = false

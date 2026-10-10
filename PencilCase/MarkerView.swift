@@ -14,8 +14,8 @@ final class MarkerView: NSView {
     private var startOrigin = CGPoint.zero
     private var samples: [(point: CGPoint, time: TimeInterval)] = []
     private var timer: Timer?
-    private var motion: RulerMomentum?
-    private var motionOrigin = CGPoint.zero
+    private var motion: InstrumentMomentum?
+    private var throwGrabOffset = CGPoint.zero
     private var limits = CGRect.zero
     private var lastTime: TimeInterval = 0
     private var started: TimeInterval = 0
@@ -58,21 +58,6 @@ final class MarkerView: NSView {
         transform.translateX(by: -33, yBy: -105)
         transform.concat()
         let barrel = NSBezierPath(roundedRect: CGRect(x: left, y: 12, width: bodyWidth, height: 146), xRadius: 9, yRadius: 9)
-        NSGraphicsContext.saveGraphicsState()
-        let shadow = NSShadow()
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.22)
-        shadow.shadowBlurRadius = 5
-        shadow.shadowOffset = CGSize(width: 1, height: -2)
-        shadow.set()
-        NSColor.white.setFill()
-        barrel.fill()
-        NSGraphicsContext.restoreGraphicsState()
-
-        NSGradient(colors: [NSColor(white: 0.78, alpha: 1), .white, NSColor(white: 0.94, alpha: 1), NSColor(white: 0.73, alpha: 1)])?.draw(in: barrel, angle: 0)
-        NSColor.white.withAlphaComponent(0.8).setStroke()
-        barrel.lineWidth = 0.6
-        barrel.stroke()
-
         let nib = NSBezierPath()
         if broad {
             nib.move(to: CGPoint(x: left + 4, y: 156))
@@ -86,6 +71,13 @@ final class MarkerView: NSView {
             nib.line(to: CGPoint(x: left + bodyWidth - 3, y: 156))
         }
         nib.close()
+        InstrumentShadow.draw([barrel, nib], in: CGRect(x: -24, y: -24, width: 114, height: 258))
+
+        NSGradient(colors: [NSColor(white: 0.78, alpha: 1), .white, NSColor(white: 0.94, alpha: 1), NSColor(white: 0.73, alpha: 1)])?.draw(in: barrel, angle: 0)
+        NSColor.white.withAlphaComponent(0.8).setStroke()
+        barrel.lineWidth = 0.6
+        barrel.stroke()
+
         NSGradient(colors: [color, color.blended(withFraction: 0.32, of: .white) ?? color, color])?.draw(in: nib, angle: 0)
 
         color.setFill()
@@ -127,6 +119,7 @@ final class MarkerView: NSView {
         startMouse = NSEvent.mouseLocation
         startOrigin = window?.frame.origin ?? .zero
         rotationCenter = CGPoint(x: startOrigin.x + bounds.midX, y: startOrigin.y + bounds.midY)
+        throwGrabOffset = CGPoint(x: NSEvent.mouseLocation.x - rotationCenter.x, y: NSEvent.mouseLocation.y - rotationCenter.y)
         initialAngle = angle
         rotationDelta = 0
         snap = RulerAngleSnap()
@@ -212,8 +205,10 @@ final class MarkerView: NSView {
         }
         guard let screen else { return }
         limits = screen.visibleFrame
-        motionOrigin = window.frame.origin
-        motion = RulerMomentum(velocity: velocity, surface: .marker)
+        let bodyWidth: CGFloat = toolID == 0 ? 20 : toolID == 1 ? 32 : 42
+        motion = InstrumentMomentum(center: CGPoint(x: window.frame.midX, y: window.frame.midY),
+                                    angle: angle * .pi / 180, velocity: velocity, grabOffset: throwGrabOffset,
+                                    size: CGSize(width: bodyWidth, height: 186), surface: .marker)
         started = ProcessInfo.processInfo.systemUptime
         lastTime = started
         let timer = Timer(timeInterval: 1 / 60, repeats: true) { [weak self] _ in
@@ -231,8 +226,12 @@ final class MarkerView: NSView {
         let dt = now - lastTime
         guard dt < 0.1, now - started < 4 else { stopMotion(); return }
         lastTime = now
-        motionOrigin = motion.step(origin: motionOrigin, size: window.frame.size, limits: limits, dt: dt)
-        window.setFrameOrigin(motionOrigin)
+        motion.step(limits: limits, dt: dt)
+        angle = RulerGeometry.signedAngle(motion.angle * 180 / .pi)
+        let size = MarkerGeometry.size(angle: angle)
+        window.setFrame(CGRect(x: motion.center.x - size.width / 2, y: motion.center.y - size.height / 2,
+                               width: size.width, height: size.height), display: false)
+        needsDisplay = true
         self.motion = motion
         if motion.isStopped { stopMotion() }
     }

@@ -5,6 +5,7 @@ import QuartzCore
 @MainActor
 final class LoupeView: NSView {
     static let levels = LoupeScale.levels
+    private let softShadow = InstrumentShadow()
     private let ringGlass = NSGlassEffectView()
     private let dialOverlay = LoupeDialOverlay()
     let renderer: LoupeRenderer
@@ -22,7 +23,7 @@ final class LoupeView: NSView {
     private var limits = CGRect.zero
     private var lastTime: TimeInterval = 0
     private var started: TimeInterval = 0
-    private let tickPlayer = LoupeTickPlayer()
+    private lazy var tickPlayer = LoupeTickPlayer()
     private var bevelImage: NSImage?
     private var bevelScale: CGFloat = 0
     private let labelText: [(normal: NSAttributedString, selected: NSAttributedString)] =
@@ -42,6 +43,11 @@ final class LoupeView: NSView {
         renderer = try LoupeRenderer()
         super.init(frame: frame)
         wantsLayer = true
+        layer?.masksToBounds = false
+        layer?.addSublayer(softShadow)
+        softShadow.update(bounds: bounds,
+                          silhouette: CGPath(ellipseIn: bounds.insetBy(dx: 5, dy: 5), transform: nil),
+                          caster: CGPath(ellipseIn: bounds.insetBy(dx: 9, dy: 9), transform: nil))
         ringGlass.frame = bounds.insetBy(dx: 5, dy: 5)
         InstrumentGlass.configure(ringGlass, cornerRadius: 145)
         ringGlass.wantsLayer = true
@@ -147,7 +153,9 @@ final class LoupeView: NSView {
         samples.removeAll()
         let p = convert(event.locationInWindow, from: nil)
         draggingDial = hypot(p.x - 150, p.y - 150) >= 108
-        if draggingDial { tickPlayer.prepare() }
+        if draggingDial && (UserDefaults.standard.object(forKey: "loupeTickSound") as? Bool ?? true) {
+            tickPlayer.prepare()
+        }
         lastAngle = atan2(p.y - 150, p.x - 150)
         startMouse = NSEvent.mouseLocation
         startOrigin = window?.frame.origin ?? .zero

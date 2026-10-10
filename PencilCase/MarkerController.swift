@@ -53,25 +53,31 @@ final class MarkerController: NSObject, ObservableObject {
     }
 
     private var canvases: [MarkerCanvasPanel] = []
-    private var strokes: [Stroke] = []
-    private var undoneStrokes: [Stroke] = []
-    private var current: Stroke?
+    private var strokes: [MarkerStroke] = []
+    private var undoneStrokes: [MarkerStroke] = []
+    private var current: MarkerStroke?
     private var guide: MarkerGuide?
+    private var lifetime = DrawingPreferences.shared.lifetime
+    private var preferenceSubscription: AnyCancellable?
     private var expiryTimer: Timer?
     private var screenObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
 
-    private struct Stroke {
-        var points: [CGPoint]
-        var color: NSColor
-        var width: CGFloat
-        var opacity: CGFloat
-        var excludedRuler: CGPath?
-        var finished: TimeInterval?
-    }
+    private var previousRulerBounds = CGRect.null
 
     private override init() {
         super.init()
+        preferenceSubscription = DrawingPreferences.shared.$automatic
+            .combineLatest(DrawingPreferences.shared.$seconds)
+            .dropFirst()
+            .sink { [weak self] automatic, seconds in
+                guard let self else { return }
+                self.lifetime = InkLifetime(automatic: automatic, seconds: Double(seconds))
+                // Preferences apply to existing ink too, using its completion time.
+                let damage = self.strokes.reduce(CGRect.null) { $0.union($1.bounds) }
+                self.expireStrokes()
+                self.refresh(damage: damage)
+            }
         spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -181,7 +187,7 @@ final class MarkerController: NSObject, ObservableObject {
                 UInt32(kVK_Escape), 0, EventHotKeyID(signature: 0x50434C52, id: 3),
                 GetApplicationEventTarget(), 0, &escapeHotKey
             )
-            escapeShortcutError = status == noErr ? nil : "Global Escape unavailable; turn off Draw on Screen in the menu"
+            escapeShortcutError = status == noErr ? nil : "Global Escape unavailable; click the active marker tip to stop drawing"
             let undoStatus = RegisterEventHotKey(
                 UInt32(kVK_ANSI_Z), UInt32(cmdKey), EventHotKeyID(signature: 0x50434C52, id: 4),
                 GetApplicationEventTarget(), 0, &undoHotKey
@@ -218,6 +224,7 @@ final class MarkerController: NSObject, ObservableObject {
             canvases.forEach { $0.resignKey() }
             NSCursor.arrow.set()
         }
+        releaseUnusedCanvases()
         redrawTools()
     }
 
@@ -229,50 +236,53 @@ final class MarkerController: NSObject, ObservableObject {
         // Bound retained geometry even during a long drawing session.
         if undoneStrokes.count > 100 { undoneStrokes.removeFirst() }
         scheduleExpiry()
-        refresh()
+        refresh(damage: stroke.bounds)
     }
 
     func redoStroke() {
-        guard current == nil, var stroke = undoneStrokes.popLast() else { return }
+        guard current == nil, let stroke = undoneStrokes.popLast() else { return }
         stroke.finished = ProcessInfo.processInfo.systemUptime
         strokes.append(stroke)
         if canvases.isEmpty { rebuildCanvases() }
         scheduleExpiry()
-        refresh()
+        refresh(damage: stroke.bounds)
     }
 
     func clearMarkings() {
+        let damage = strokes.reduce(current?.bounds ?? .null) { $0.union($1.bounds) }
         current = nil
         guide = nil
         strokes.removeAll()
         undoneStrokes.removeAll()
         expiryTimer?.invalidate()
         expiryTimer = nil
-        refresh()
+        refresh(damage: damage)
     }
 
     func beginStroke(at point: CGPoint) {
         guard isDrawing else { return }
         guide = RulerController.shared.markingGuides.min { $0.distance(to: point) < $1.distance(to: point) }
         if let candidate = guide, candidate.distance(to: point) > 12 { guide = nil }
-        current = Stroke(points: [guide?.strokePoint(point, width: CGFloat(strokeWidth)) ?? point], color: inkColor, width: CGFloat(strokeWidth),
-                         opacity: tools[selectedToolID].opacity, excludedRuler: RulerController.shared.markingExclusionPath)
-        refresh()
+        let exclusion = RulerController.shared.markingExclusionPath
+        previousRulerBounds = exclusion?.boundingBoxOfPath ?? .null
+        let stroke = MarkerStroke(point: guide?.strokePoint(point, width: CGFloat(strokeWidth)) ?? point,
+                                  color: inkColor, width: CGFloat(strokeWidth),
+                                  opacity: tools[selectedToolID].opacity, excludedRuler: exclusion)
+        current = stroke
+        refresh(damage: stroke.bounds)
     }
 
     func continueStroke(at point: CGPoint) {
-        guard var stroke = current else { return }
+        guard let stroke = current else { return }
         let point = guide?.strokePoint(point, width: stroke.width) ?? point
-        if let last = stroke.points.last, hypot(point.x - last.x, point.y - last.y) < 0.5 { return }
-        if guide != nil, stroke.points.count == 2 { stroke.points[1] = point }
-        else { stroke.points.append(point) }
-        current = stroke
-        refresh()
+        guard hypot(point.x - stroke.last.x, point.y - stroke.last.y) >= 0.5 else { return }
+        let damage = stroke.append(point, guided: guide != nil)
+        refresh(damage: damage)
     }
 
     func finishStroke() {
-        guard var stroke = current else { return }
-        stroke.finished = ProcessInfo.processInfo.systemUptime
+        guard let stroke = current else { return }
+        stroke.finish(at: ProcessInfo.processInfo.systemUptime)
         strokes.append(stroke)
         undoneStrokes.removeAll()
         current = nil
@@ -287,7 +297,7 @@ final class MarkerController: NSObject, ObservableObject {
         guard let oldest = strokes.first?.finished else { return }
         let age = ProcessInfo.processInfo.systemUptime - oldest
         // Sleep while the ink is static; redraw only during its half-second fade.
-        let delay = age < 30 ? 30 - age : 1 / 30.0
+        guard let delay = lifetime.nextUpdate(age: age) else { return }
         let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.expireStrokes() }
         }
@@ -297,71 +307,78 @@ final class MarkerController: NSObject, ObservableObject {
 
     private func expireStrokes() {
         let now = ProcessInfo.processInfo.systemUptime
-        strokes.removeAll { now - ($0.finished ?? now) >= 30.5 }
-        refresh()
+        let damage = strokes.reduce(CGRect.null) { result, stroke in
+            now - (stroke.finished ?? now) >= lifetime.seconds ? result.union(stroke.bounds) : result
+        }
+        strokes.removeAll { lifetime.expired(age: now - ($0.finished ?? now)) }
+        refresh(damage: damage)
         scheduleExpiry()
     }
 
-    private func refresh() {
+    private func refresh(damage: CGRect = .null) {
         let visibleInk = !strokes.isEmpty || current != nil
         if canUndo != visibleInk { canUndo = visibleInk }
         let redoAvailable = current == nil && !undoneStrokes.isEmpty
         if canRedo != redoAvailable { canRedo = redoAvailable }
         if hasMarkings != visibleInk { hasMarkings = visibleInk }
+        let inkBounds = strokes.map(\.bounds) + (current.map { [$0.bounds] } ?? [])
         for panel in canvases {
-            panel.contentView?.needsDisplay = true
+            if let view = panel.contentView as? MarkerCanvasView {
+                view.updateInkRegions(inkBounds)
+                invalidate(damage, in: view)
+            }
             if hasMarkings && !panel.isVisible { panel.orderFrontRegardless() }
             if !hasMarkings && !isDrawing { panel.orderOut(nil) }
         }
+        releaseUnusedCanvases()
+    }
+
+    private func releaseUnusedCanvases() {
+        guard !isDrawing, !hasMarkings else { return }
+        canvases.forEach { $0.orderOut(nil); $0.contentView = nil }
+        canvases.removeAll()
+    }
+
+    private func invalidate(_ screenRect: CGRect, in view: NSView) {
+        guard !screenRect.isNull, let window = view.window else { return }
+        let local = view.convert(window.convertFromScreen(screenRect), from: nil).intersection(view.bounds)
+        guard !local.isNull, !local.isEmpty else { return }
+        (view as? MarkerCanvasView)?.invalidateInk(in: local.integral.intersection(view.bounds))
     }
 
     func rulerDidChange() {
-        guard hasMarkings else { return }
-        canvases.forEach { $0.contentView?.needsDisplay = true }
+        let bounds = RulerController.shared.markingExclusionPath?.boundingBoxOfPath ?? .null
+        let damage = previousRulerBounds.union(bounds).insetBy(dx: -2, dy: -2)
+        previousRulerBounds = bounds
+        guard hasMarkings, !damage.isNull else { return }
+        for panel in canvases {
+            guard let view = panel.contentView else { continue }
+            for stroke in strokes { invalidate(stroke.bounds.intersection(damage), in: view) }
+            if let current { invalidate(current.bounds.intersection(damage), in: view) }
+        }
     }
 
-    func drawInk(in view: NSView) {
+    func drawInk(in view: NSView, dirtyRect: CGRect? = nil) {
         guard let context = NSGraphicsContext.current?.cgContext, let window = view.window else { return }
+        let dirty = (dirtyRect ?? view.bounds).intersection(view.bounds)
+        guard !dirty.isNull, !dirty.isEmpty else { return }
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.clip(to: dirty)
+        // Repaint all intersecting strokes in their original order, rather than
+        // painting new translucent ink onto an already composited canvas.
+        context.clear(dirty)
+        let origin = view.convert(window.convertPoint(fromScreen: .zero), from: nil)
+        context.translateBy(x: origin.x, y: origin.y)
+        let screenBounds = view.bounds.offsetBy(dx: -origin.x, dy: -origin.y)
+        let screenDirty = dirty.offsetBy(dx: -origin.x, dy: -origin.y)
         let now = ProcessInfo.processInfo.systemUptime
-        let currentRuler = RulerController.shared.markingExclusionPath
-        for stroke in strokes + (current.map { [$0] } ?? []) {
-            guard let first = stroke.points.first else { continue }
-            context.saveGState()
-            defer { context.restoreGState() }
-
-            // Retain the original cutout so moving the ruler never reveals hidden ink.
-            // Also protect its current surface when it moves across older strokes.
-            let origin = view.convert(window.convertPoint(fromScreen: .zero), from: nil)
-            var transform = CGAffineTransform(translationX: origin.x, y: origin.y)
-            for exclusion in [stroke.excludedRuler, currentRuler].compactMap({ $0 }) {
-                if let localPath = exclusion.copy(using: &transform) {
-                    context.beginPath()
-                    context.addRect(view.bounds.insetBy(dx: -1, dy: -1))
-                    context.addPath(localPath)
-                    context.clip(using: .evenOdd)
-                }
-            }
-
-            let age = stroke.finished.map { now - $0 } ?? 0
-            let alpha = stroke.opacity * max(0, min(1, (30.5 - age) / 0.5))
-            context.setStrokeColor(stroke.color.withAlphaComponent(alpha).cgColor)
-            context.setFillColor(stroke.color.withAlphaComponent(alpha).cgColor)
-            context.setLineWidth(stroke.width)
-            context.setLineCap(.round)
-            context.setLineJoin(.round)
-
-            func local(_ point: CGPoint) -> CGPoint {
-                view.convert(window.convertPoint(fromScreen: point), from: nil)
-            }
-            if stroke.points.count == 1 {
-                let p = local(first)
-                context.fillEllipse(in: CGRect(x: p.x - stroke.width / 2, y: p.y - stroke.width / 2, width: stroke.width, height: stroke.width))
-            } else {
-                context.beginPath()
-                context.move(to: local(first))
-                for point in stroke.points.dropFirst() { context.addLine(to: local(point)) }
-                context.strokePath()
-            }
+        let ruler = RulerController.shared.markingExclusionPath
+        for stroke in strokes where stroke.bounds.intersects(screenDirty) {
+            stroke.draw(in: context, at: now, canvasBounds: screenBounds, ruler: ruler, lifetime: lifetime)
+        }
+        if let current, current.bounds.intersects(screenDirty) {
+            current.draw(in: context, at: now, canvasBounds: screenBounds, ruler: ruler, lifetime: lifetime)
         }
     }
 
@@ -379,7 +396,9 @@ final class MarkerController: NSObject, ObservableObject {
             panel.isReleasedWhenClosed = false
             panel.ignoresMouseEvents = true
             panel.collectionBehavior = [.canJoinAllApplications]
-            panel.contentView = MarkerCanvasView(frame: CGRect(origin: .zero, size: screen.frame.size))
+            let view = MarkerCanvasView(frame: CGRect(origin: .zero, size: screen.frame.size))
+            panel.contentView = view
+            view.updateInkRegions(strokes.map(\.bounds) + (current.map { [$0.bounds] } ?? []))
             if hasMarkings { panel.orderFrontRegardless() }
             return panel
         }
@@ -421,11 +440,47 @@ private final class MarkerCanvasPanel: NSPanel {
 }
 
 private final class MarkerCanvasView: NSView {
+    private var tiles: [MarkerInkTile: MarkerInkTileView] = [:]
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        // This full-screen view receives input, but never rasterizes a full-screen
+        // bitmap. Only the small ink subviews allocate drawable backing surfaces.
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {}
+
+    func updateInkRegions(_ regions: [CGRect]) {
+        guard let window else { return }
+        let localRegions = regions.map { convert(window.convertFromScreen($0), from: nil) }
+        let required = MarkerInkTile.covering(localRegions, in: bounds)
+        for key in Set(tiles.keys).subtracting(required) {
+            tiles.removeValue(forKey: key)?.removeFromSuperview()
+        }
+        for key in required where tiles[key] == nil {
+            let tile = MarkerInkTileView(frame: key.frame.intersection(bounds))
+            tile.wantsLayer = true
+            addSubview(tile)
+            tiles[key] = tile
+            tile.needsDisplay = true
+        }
+    }
+
+    func invalidateInk(in rect: CGRect) {
+        for tile in tiles.values {
+            let intersection = rect.intersection(tile.frame)
+            guard !intersection.isNull, !intersection.isEmpty else { continue }
+            tile.setNeedsDisplay(convert(intersection, to: tile))
+        }
+    }
+
     override var acceptsFirstResponder: Bool { true }
     override func resetCursorRects() {
         if MarkerController.shared.isDrawing { addCursorRect(bounds, cursor: .crosshair) }
     }
-    override func draw(_ dirtyRect: NSRect) { MarkerController.shared.drawInk(in: self) }
     override func mouseDown(with event: NSEvent) {
         window?.makeKey()
         window?.makeFirstResponder(self)
@@ -438,5 +493,14 @@ private final class MarkerCanvasView: NSView {
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { MarkerController.shared.setDrawing(false) }
         else { super.keyDown(with: event) }
+    }
+}
+
+/// Transparent to hit testing: the desktop input view keeps ownership of drags,
+/// including when a stroke crosses tile boundaries.
+private final class MarkerInkTileView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        MarkerController.shared.drawInk(in: self, dirtyRect: dirtyRect)
     }
 }

@@ -19,7 +19,7 @@ final class LoupeController: ObservableObject {
 
     private init() {
         capture.receive = { [weak self] buffer in
-            guard let self, self.isVisible, self.panel?.isOnActiveSpace == true else { return }
+            guard let self, self.isVisible, !self.isRecoveringSpace, self.panel?.isOnActiveSpace == true else { return }
             self.loupe?.status = nil
             self.loupe?.renderer.receive(buffer)
         }
@@ -49,8 +49,9 @@ final class LoupeController: ObservableObject {
                 if let panel, !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(panel.frame) }) {
                     resetPosition()
                 }
+                panel?.contentView?.alphaValue = 0
                 panel?.orderFrontRegardless()
-                updateActiveSpace()
+                updateActiveSpace(afterTransition: false)
             } catch { showError(error.localizedDescription) }
         } else {
             isVisible = false
@@ -68,7 +69,7 @@ final class LoupeController: ObservableObject {
         }
     }
 
-    private func updateActiveSpace() {
+    private func updateActiveSpace(afterTransition: Bool = true) {
         spaceRecoveryTask?.cancel()
         task?.cancel()
         capture.stop()
@@ -76,8 +77,10 @@ final class LoupeController: ObservableObject {
         isRecoveringSpace = true
         loupe?.cancelInteraction()
         loupe?.renderer.setActive(false)
-        // Native Space membership hides the panel without moving or ordering it out.
-        // Keep its last image, but capture nothing while its desktop is inactive.
+        loupe?.renderer.clear()
+        panel?.contentView?.alphaValue = 0
+        // Never carry a captured desktop image across a Space transition.
+        // Reveal the complete instrument together, already magnifying its backdrop.
         guard panel?.isOnActiveSpace == true else {
             isRecoveringSpace = false
             spaceRecoveryTask = nil
@@ -90,7 +93,9 @@ final class LoupeController: ObservableObject {
 
             // Space notifications can arrive during the desktop animation.
             // Debounce repeated transitions without blocking the input thread.
-            do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+            if afterTransition {
+                do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+            }
             guard !Task.isCancelled, isVisible, panel?.isOnActiveSpace == true else { return }
 
             loupe?.renderer.setActive(true)
@@ -114,7 +119,7 @@ final class LoupeController: ObservableObject {
     func resetPosition() {
         let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
         guard let panel, let frame = screen?.visibleFrame else { return }
-        panel.setFrameOrigin(CGPoint(x: frame.midX - 150, y: frame.midY - 150))
+        panel.setFrameOrigin(CGPoint(x: frame.midX - panel.frame.width / 2, y: frame.midY - panel.frame.height / 2))
     }
 
     func updatePosition() {
@@ -147,11 +152,15 @@ final class LoupeController: ObservableObject {
         error = message
         loupe?.renderer.clear()
         loupe?.status = "Loupe unavailable\nSee Pencil Case menu"
+        if isVisible, panel?.isOnActiveSpace == true { panel?.contentView?.alphaValue = 1 }
     }
 
     private func makePanel() throws {
         let view = try LoupeView(loupeFrame: CGRect(x: 0, y: 0, width: 300, height: 300))
-        let window = NSPanel(contentRect: view.bounds, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let container = LoupeContainerView(frame: CGRect(x: 0, y: 0, width: 348, height: 348))
+        view.frame.origin = CGPoint(x: 24, y: 24)
+        container.addSubview(view)
+        let window = NSPanel(contentRect: container.bounds, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         window.title = "Pencil Case Loupe"
         window.isOpaque = false
         window.backgroundColor = .clear
@@ -162,9 +171,23 @@ final class LoupeController: ObservableObject {
         window.hidesOnDeactivate = false
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.canJoinAllApplications]
-        window.contentView = view
+        window.contentView = container
         loupe = view
         panel = window
+        view.renderer.didRevealFreshFrame = { [weak self] in
+            guard let self, self.isVisible, !self.isRecoveringSpace,
+                  self.panel?.isOnActiveSpace == true else { return }
+            self.panel?.contentView?.alphaValue = 1
+        }
         resetPosition()
+    }
+}
+
+/// Transparent padding for the loupe shadow must not intercept pointer events.
+@MainActor
+private final class LoupeContainerView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        return hit === self ? nil : hit
     }
 }

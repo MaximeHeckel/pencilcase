@@ -20,8 +20,8 @@ nonisolated enum MarkerGeometry {
 
     static func size(angle: CGFloat) -> CGSize {
         let radians = angle * .pi / 180
-        return CGSize(width: ceil(abs(cos(radians)) * 66 + abs(sin(radians)) * 210),
-                      height: ceil(abs(sin(radians)) * 66 + abs(cos(radians)) * 210))
+        return CGSize(width: ceil(abs(cos(radians)) * 66 + abs(sin(radians)) * 210) + 48,
+                      height: ceil(abs(sin(radians)) * 66 + abs(cos(radians)) * 210) + 48)
     }
 
     static func localPoint(_ point: CGPoint, size: CGSize, angle: CGFloat) -> CGPoint {

@@ -15,6 +15,8 @@ final class LoupeRenderer: NSObject, MTKViewDelegate {
     private let inFlight = DispatchSemaphore(value: 1)
     private let renderQueue = DispatchQueue(label: "PencilCase.loupe.render", qos: .userInteractive)
     private var needsFrame = true
+    private var presentationGeneration: UInt64 = 0
+    var didRevealFreshFrame: (() -> Void)?
     var centerUV = SIMD2<Float>(0.5, 0.5)
     var inverseScreenSize = SIMD2<Float>(1 / 1920, 1 / 1080)
     var zoom: Float = 2
@@ -43,6 +45,7 @@ final class LoupeRenderer: NSObject, MTKViewDelegate {
         view.clearColor = MTLClearColorMake(0, 0, 0, 0)
         view.layer?.isOpaque = false
         view.isPaused = true
+        view.alphaValue = 0
         view.preferredFramesPerSecond = 120
         view.enableSetNeedsDisplay = false
         view.framebufferOnly = true
@@ -58,9 +61,13 @@ final class LoupeRenderer: NSObject, MTKViewDelegate {
         buffer = pixelBuffer
         image = texture
         requestDraw()
+        // Submit the first fresh frame even while the view is visually hidden.
+        if !view.isPaused && view.alphaValue == 0 { draw(in: view) }
     }
 
     func clear() {
+        presentationGeneration &+= 1
+        view.alphaValue = 0
         buffer = nil
         image = nil
         if let cache { CVMetalTextureCacheFlush(cache, 0) }
@@ -87,11 +94,30 @@ final class LoupeRenderer: NSObject, MTKViewDelegate {
                             uniforms: Uniforms(center: centerUV, inverseScreen: inverseScreenSize,
                                                diameter: Float(Self.diameter), zoom: zoom))
         let semaphore = inFlight
+        let generation = presentationGeneration
+        let hasImage = image != nil
+        let awaitingReveal = view.alphaValue == 0
 
         // nextDrawable can block while the compositor owns the surfaces. Never
         // acquire it on AppKit's input thread, and never enqueue a backlog of jobs.
         renderQueue.async { [weak self] in
-            guard job.render(completed: { semaphore.signal() }) else {
+            guard job.render(completed: { [weak self] succeeded in
+                semaphore.signal()
+                // Steady-state rendering belongs exclusively to the display callback.
+                // Do not mutate AppKit opacity or start a second render loop per frame.
+                guard awaitingReveal else { return }
+                Task { @MainActor [weak self] in
+                    guard let self, !self.view.isPaused, self.view.alphaValue == 0 else { return }
+                    if self.presentationGeneration == generation, hasImage, succeeded {
+                        self.view.alphaValue = 1
+                        self.didRevealFreshFrame?()
+                    } else if self.needsFrame {
+                        // Only bootstrap a hidden lens whose fresh frame was blocked
+                        // by an old GPU job. Once revealed, wait for the display tick.
+                        self.draw(in: self.view)
+                    }
+                }
+            }) else {
                 semaphore.signal()
                 Task { @MainActor [weak self] in self?.requestDraw() }
                 return
@@ -109,7 +135,7 @@ final class LoupeRenderer: NSObject, MTKViewDelegate {
         let image: CVMetalTexture?
         let uniforms: Uniforms
 
-        nonisolated func render(completed: @escaping @Sendable () -> Void) -> Bool {
+        nonisolated func render(completed: @escaping @Sendable (Bool) -> Void) -> Bool {
             autoreleasepool {
                 guard let drawable = layer.nextDrawable(),
                       let command = queue.makeCommandBuffer() else { return false }
@@ -131,9 +157,9 @@ final class LoupeRenderer: NSObject, MTKViewDelegate {
 
                 encoder.endEncoding()
                 command.present(drawable)
-                command.addCompletedHandler { [self] _ in
+                command.addCompletedHandler { [self] command in
                     withExtendedLifetime(self) {}
-                    completed()
+                    completed(command.status == .completed)
                 }
                 command.commit()
                 return true

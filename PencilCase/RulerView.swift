@@ -11,6 +11,7 @@ final class RulerView: NSView {
     private(set) var geometry = RulerGeometry()
     private var gesture: Gesture?
     private var drawingAlongEdge = false
+    private let softShadow = InstrumentShadow()
     private var rotationEnvelope = false
     private var resizeEnvelope: CGRect?
     private var motionTimer: Timer?
@@ -47,8 +48,10 @@ final class RulerView: NSView {
         wantsLayer = true
         layer?.masksToBounds = false
         instrument.wantsLayer = true
+        instrument.layer?.masksToBounds = false
         instrument.autoresizesSubviews = false
         addSubview(instrument)
+        instrument.layer?.addSublayer(softShadow)
         instrument.addSubview(glass)
         layoutInstrument()
     }
@@ -137,6 +140,9 @@ final class RulerView: NSView {
         instrument.frame = CGRect(x: instrumentCenter.x - size.width / 2,
                                   y: instrumentCenter.y - size.height / 2, width: size.width, height: size.height)
         instrument.bounds = CGRect(origin: .zero, size: size)
+        softShadow.update(bounds: instrument.bounds,
+                          silhouette: CGPath(roundedRect: instrument.bounds, cornerWidth: RulerGeometry.cornerRadius, cornerHeight: RulerGeometry.cornerRadius, transform: nil),
+                          caster: CGPath(roundedRect: instrument.bounds.insetBy(dx: 4, dy: 4), cornerWidth: RulerGeometry.cornerRadius, cornerHeight: RulerGeometry.cornerRadius, transform: nil))
         glass.frame = instrument.bounds
         glass.bounds = instrument.bounds
         markings.frame = glass.bounds
@@ -165,7 +171,7 @@ final class RulerView: NSView {
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
 
-        let span = ceil(hypot(geometry.width, RulerGeometry.height)) + 4
+        let span = ceil(hypot(geometry.width, RulerGeometry.height)) + 48
         let size = rotationEnvelope ? CGSize(width: span, height: span) : geometry.enclosingSize
         let target = resizeEnvelope ?? CGRect(x: center.x - size.width / 2, y: center.y - size.height / 2,
                                                width: size.width, height: size.height)

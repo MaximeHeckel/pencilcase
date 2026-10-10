@@ -31,8 +31,8 @@ struct RulerGeometry {
     var radians: CGFloat { angle * .pi / 180 }
     var axis: CGPoint { CGPoint(x: cos(radians), y: sin(radians)) }
     var enclosingSize: CGSize {
-        CGSize(width: ceil(abs(cos(radians)) * width + abs(sin(radians)) * Self.height) + 4,
-               height: ceil(abs(sin(radians)) * width + abs(cos(radians)) * Self.height) + 4)
+        CGSize(width: ceil(abs(cos(radians)) * width + abs(sin(radians)) * Self.height) + 48,
+               height: ceil(abs(sin(radians)) * width + abs(cos(radians)) * Self.height) + 48)
     }
 
     static func normalizedAngle(_ angle: CGFloat, snapping: Bool) -> CGFloat {
