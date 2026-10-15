@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Xcode build products and archives
+build/
+DerivedData/
+*.xcarchive
+*.dSYM/
+*.dSYM.zip
+*.ipa
+
+# Per-user Xcode settings (keep shared schemes and workspace metadata)
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Swift Package Manager (keep Package.resolved)
+.build/
+.swiftpm/
+
+# Local credentials and signing exports
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
