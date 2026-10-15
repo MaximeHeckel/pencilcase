@@ -27,7 +27,8 @@ final class LoupeView: NSView {
     private var bevelImage: NSImage?
     private var bevelScale: CGFloat = 0
     private let labelText: [(normal: NSAttributedString, selected: NSAttributedString)] =
-        ["1×", "1.25×", "1.5×", "2×", "3×", "4×", "6×", "8×"].map { text in
+        LoupeScale.levels.map { level in
+            let text = "\(level.formatted(.number.precision(.fractionLength(0...2))))×"
             let normal = NSAttributedString(string: text, attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium),
                 .foregroundColor: NSColor(calibratedWhite: 0.16, alpha: 0.8)

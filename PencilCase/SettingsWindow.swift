@@ -80,8 +80,8 @@ struct PencilCaseSettings: View {
                 Section("Motion") {
                     Toggle("Throwing physics", isOn: $momentum)
                 }
-                Section("Sound") {
-                    Toggle("Loupe dial ticks", isOn: $dialSound)
+                Section("Loupe") {
+                    Toggle("Dial ticks", isOn: $dialSound)
                 }
                 Section {
                     Toggle("Automatically remove drawings", isOn: $drawing.automatic)

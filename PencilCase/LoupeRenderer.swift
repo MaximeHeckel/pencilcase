@@ -217,6 +217,23 @@ final class LoupeRenderer: NSObject, MTKViewDelegate {
         float lowerGlint = exp(-pow((r - 0.965) / 0.012, 2.0)) * oppositeArc * 0.24;
         float reflection = edgeMask * (softReflection + crispReflection + lowerGlint);
         color = mix(color, float3(1.0), saturate(reflection + edge * light * 0.12));
+
+        // Reveal physical-pixel boundaries from 7.5× to 8× using capture dimensions.
+        // Use the refracted UV so the grid follows the image at the lens edge.
+        float gridFade = smoothstep(7.5, 8.0, u.zoom);
+        float2 gridSize = float2(source.get_width(), source.get_height());
+        float2 pixel = uv * gridSize;
+        float2 boundaryDistance = min(fract(pixel), 1.0 - fract(pixel));
+        float2 outputDistance = boundaryDistance / max(fwidth(pixel), float2(0.00001));
+        float grid = 1.0 - smoothstep(0.25, 0.75, min(outputDistance.x, outputDistance.y));
+        // Ease between contrasting neutrals to avoid abrupt color changes.
+        float3 linearColor = select(color / 12.92, pow((color + 0.055) / 1.055, float3(2.4)), color > 0.04045);
+        float luminance = dot(linearColor, float3(0.2126, 0.7152, 0.0722));
+        float3 gridColor = float3(1.0 - smoothstep(0.12, 0.24, luminance));
+
+        // Keep the inspection grid quiet and clear of the refracted rim.
+        float gridRimFade = 1.0 - smoothstep(0.76, 0.88, r);
+        color = mix(color, gridColor, grid * gridFade * gridRimFade * 0.40);
         return float4(color * alpha, alpha);
     }
     """

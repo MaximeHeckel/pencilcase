@@ -2,7 +2,7 @@ import Foundation
 
 /// One shared angular scale for labels, ticks, continuous zoom, and feedback.
 nonisolated enum LoupeScale {
-    static let levels: [Double] = [1, 1.25, 1.5, 2, 3, 4, 6, 8]
+    static let levels: [Double] = [1, 1.25, 1.5, 2, 3, 4, 6, 8, 10]
     static let degreesPerLevel = 32.0
     static let subdivisions = 8
 
